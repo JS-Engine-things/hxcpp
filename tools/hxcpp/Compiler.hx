@@ -640,6 +640,11 @@ class Compiler
 
       // Like objs/hxcpp.pch or objs/wx.gch
       var pch_name = dir + "/" + file + mPCHExt;
+
+      // gcc falls back to the plain header next to the .gch when it can't use it
+      if (mPCH == "gcc")
+         writePchForwarder(inGroup, dir, file);
+
       if (inGroup.isCached() || inReuseIfPossible)
       {
           // No obj needed for gcc
@@ -706,6 +711,18 @@ class Compiler
       if (mPCH == "msvc")
          return  PathManager.combine(dir, file + mExt);
       return null;
+   }
+
+   function writePchForwarder(inGroup:FileGroup, inDir:String, inFile:String)
+   {
+      var header = FileSystem.fullPath(inGroup.mPrecompiledHeaderDir + "/" + inGroup.mPrecompiledHeader + ".h");
+      var forwarder = inDir + "/" + inFile + ".h";
+      var content = '#include "' + header.split("\\").join("/") + '"\n';
+      if (!FileSystem.exists(forwarder) || sys.io.File.getContent(forwarder) != content)
+      {
+         PathManager.mkdir(inDir);
+         sys.io.File.saveContent(forwarder, content);
+      }
    }
 
    public function setPCH(inPCH:String)
