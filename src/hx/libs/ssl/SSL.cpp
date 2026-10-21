@@ -510,7 +510,7 @@ void _hx_ssl_conf_set_ca( Dynamic hconf, Dynamic hcert ) {
 	mbedtls_ssl_conf_ca_chain(conf->c, cert ? cert->c : NULL, NULL);
 
 #else
-	if( hconf.mPtr ){
+	if( hcert.mPtr ){
 		sslcert *cert = val_cert(hcert);
 		mbedtls_ssl_conf_ca_chain( conf->c, cert->c, NULL );
 	}else{

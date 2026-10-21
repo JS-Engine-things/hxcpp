@@ -396,7 +396,7 @@ public:
    std::vector< CppiaClassInfo * > classes;
    std::vector< CppiaExpr * >      markable;
 
-   hx::UnorderedSet< CppiaExpr * > allExprs;
+   std::unordered_set< CppiaExpr * > allExprs;
    std::unordered_set<int>         allFileIds;
 
    typedef std::map< std::string, int > InterfaceSlots;
