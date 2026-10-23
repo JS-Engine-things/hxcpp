@@ -474,8 +474,6 @@ class Compiler
                      FileSystem.deleteFile(obj_name);
                   BuildTool.setThreadError(err);
                }
-               else
-                  inProgress.fileDone();
             }
          }
          else
@@ -489,7 +487,6 @@ class Compiler
                Tools.exit (result);
                //throw "Error : " + result + " - build cancelled";
             }
-            inProgress.fileDone();
          }
 
          if (!Log.verbose && (inTid >= 0 && BuildTool.threadExitCode == 0))
