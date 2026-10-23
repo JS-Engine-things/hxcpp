@@ -22,6 +22,16 @@ hx::thread::ConditionVariable_obj::ConditionVariable_obj() : impl(new Impl())
 
 void hx::thread::ConditionVariable_obj::acquire()
 {
+	// Uncontended fast path - skip the GC free zone unless we will block
+	// The free zone below was this thread's handshake with the collector. A
+	// thread that only ever takes the lock uncontended, allocating nothing,
+	// otherwise never reaches a safe point, and a collection waits for it
+	// for ever.
+	if (hx::gPauseForCollect)
+		__hxcpp_gc_safe_point();
+	if (impl->mutex.try_lock())
+		return;
+
 	hx::AutoGCFreeZone zone;
 
 	impl->mutex.lock();
@@ -29,6 +39,8 @@ void hx::thread::ConditionVariable_obj::acquire()
 
 bool hx::thread::ConditionVariable_obj::tryAcquire()
 {
+	if (hx::gPauseForCollect)
+		__hxcpp_gc_safe_point();
 	return impl->mutex.try_lock();
 }
 

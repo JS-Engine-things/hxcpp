@@ -1,5 +1,6 @@
 #ifndef HX_ARRAY_H
 #define HX_ARRAY_H
+#include <vector>
 #include <cpp/FastIterator.h>
 
 // --- hx::ReturnNull ------------------------------------------------------
@@ -56,6 +57,28 @@ template<> struct ArrayTraits<double> { enum { StoreType = arrayFloat}; };
 template<> struct ArrayTraits<Dynamic> { enum { StoreType = arrayObject }; };
 template<> struct ArrayTraits<String> { enum { StoreType = arrayString }; };
 template<> struct ArrayTraits< ::cpp::Int64> { enum { StoreType = arrayInt64 }; };
+
+// Element types that are plain values, with no GC pointers, can be sorted
+// in place.  Everything else must go through the index-based safeSort so
+// references are not hidden inside the sorter's working buffers.  Note this
+// is broader than the ArrayTraits StoreType: bool, the small int types and
+// the char types all store as arrayObject for boxing purposes, but their
+// buffers hold values, not object pointers.
+template<typename T> struct ArrayValueSortable { enum { Yes = 0 }; };
+template<> struct ArrayValueSortable<bool> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<char> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<signed char> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<unsigned char> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<char16_t> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<char32_t> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<short> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<unsigned short> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<int> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<unsigned int> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<float> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<double> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable< ::cpp::Int64> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable< ::cpp::UInt64> { enum { Yes = 1 }; };
 
 }
 
@@ -232,10 +255,12 @@ public:
 
    inline void resize(int inSize)
    {
+      if (inSize<0)
+         inSize = 0;
       if (inSize<length)
       {
          int s = GetElementSize();
-         memset(mBase + inSize*s, 0, (length-inSize)*s);
+         memset(mBase + (size_t)inSize*s, 0, (size_t)(length-inSize)*s);
          length = inSize;
       }
       else if (inSize>length)
@@ -346,9 +371,9 @@ public:
 
    inline void EnsureSize(int inLen) const
    {
-      if (inLen>length)
+      if ((unsigned int)inLen>(unsigned int)length)
       {
-         if (inLen>mAlloc)
+         if (inLen<0 || inLen>mAlloc)
             Realloc(inLen);
          length = inLen;
       }
@@ -475,6 +500,7 @@ template<> struct ArrayClassId< ::cpp::Int64> { enum { id=hx::clsIdArrayInt64 };
 
 // sort...
 #include <algorithm>
+#include <memory>
 
 namespace hx
 {
@@ -484,6 +510,77 @@ inline bool arrayElemEq(const T &a, const T &b) { return a==b; }
 template<>
 inline bool arrayElemEq<Dynamic>(const Dynamic &a, const Dynamic &b) {
    return hx::DynamicEq(a,b);
+}
+
+// Stable merge sort for Array.sort.  The comparator is user code and need not
+// be consistent (it may answer at random), which std::stable_sort does not
+// allow: libstdc++'s insertion step then runs off the front of the range.
+// Here such a comparator only leaves the order unspecified.  Every access
+// stays in range and every element is kept.
+template<typename T, typename LESS>
+void StableSortRange(T *ioData, int inFrom, int inTo, T *ioBuffer, LESS &inLess)
+{
+   if (inTo-inFrom<=16)
+   {
+      // Binary insertion, after any equal elements
+      for(int i=inFrom+1;i<inTo;i++)
+      {
+         T value = ioData[i];
+         int lo = inFrom;
+         int hi = i;
+         while(lo<hi)
+         {
+            int mid = lo + ((hi-lo)>>1);
+            if (inLess(value, ioData[mid]))
+               hi = mid;
+            else
+               lo = mid+1;
+         }
+         for(int j=i;j>lo;j--)
+            ioData[j] = ioData[j-1];
+         ioData[lo] = value;
+      }
+      return;
+   }
+
+   int mid = inFrom + ((inTo-inFrom)>>1);
+   StableSortRange(ioData, inFrom, mid, ioBuffer, inLess);
+   StableSortRange(ioData, mid, inTo, ioBuffer, inLess);
+
+   // Already in order, or in reverse order
+   if (!inLess(ioData[mid], ioData[mid-1]))
+      return;
+   if (inLess(ioData[inTo-1], ioData[inFrom]))
+   {
+      std::rotate(ioData+inFrom, ioData+mid, ioData+inTo);
+      return;
+   }
+
+   int leftLength = mid-inFrom;
+   for(int i=0;i<leftLength;i++)
+      ioBuffer[i] = ioData[inFrom+i];
+   int left = 0;
+   int right = mid;
+   int out = inFrom;
+   while(left<leftLength && right<inTo)
+   {
+      if (inLess(ioData[right], ioBuffer[left]))
+         ioData[out++] = ioData[right++];
+      else
+         ioData[out++] = ioBuffer[left++];
+   }
+   while(left<leftLength)
+      ioData[out++] = ioBuffer[left++];
+}
+
+template<typename T, typename LESS>
+void StableSort(T *ioData, int inLength, LESS &inLess)
+{
+   if (inLength<2)
+      return;
+   // No left half is longer than inLength/2
+   std::unique_ptr<T[]> buffer(inLength>16 ? new T[inLength/2] : nullptr);
+   StableSortRange(ioData, 0, inLength, buffer.get(), inLess);
 }
 }
 
@@ -620,7 +717,10 @@ public:
    {
       EnsureSize(inStart+inElements);
       int s = GetElementSize();
-      ::memcpy(mBase + s*inStart, inData, s*inElements);
+      // An empty array may have no buffer, and memcpy is undefined on null
+      // even for zero bytes
+      if (inElements>0)
+         ::memcpy(mBase + (size_t)s*inStart, inData, (size_t)s*inElements);
       if (hx::ContainsPointers<ELEM_>())
       {
          HX_OBJ_WB_PESSIMISTIC_GET(this);
@@ -894,20 +994,35 @@ public:
       std::sort(e, e+length, Sorter(inSorter) );
    }
 
-   void sort(SorterFunc inSorter)
+   // Compares two elements through their boxes.  It holds the boxed array
+   // itself, not a pointer into its buffer: a collection in the comparator
+   // marks the boxes only through the array, and a pointer to the buffer
+   // keeps the buffer alive but not the boxes in it.  The two boxes are
+   // copied out first, so the comparator is not handed references into a
+   // buffer a moving collection could relocate.
+   struct BoxedSorter
    {
-      if ( (int)hx::ArrayTraits<ELEM_>::StoreType==(int)hx::arrayObject ||
-          (int)hx::ArrayTraits<ELEM_>::StoreType==(int)hx::arrayString)
+      hx::ArrayBase *mBoxed;
+      SorterFunc     mFunc;
+
+      BoxedSorter(hx::ArrayBase *inBoxed, SorterFunc inFunc) : mBoxed(inBoxed), mFunc(inFunc) { }
+      bool operator()(int inA, int inB)
       {
-         // Keep references from being hidden inside sorters buffers
-         safeSort(inSorter, (int)hx::ArrayTraits<ELEM_>::StoreType==(int)hx::arrayString);
+         Dynamic *boxed = (Dynamic *)mBoxed->GetBase();
+         Dynamic a = boxed[inA];
+         Dynamic b = boxed[inB];
+#if (HXCPP_API_LEVEL>=500)
+         return mFunc(a, b) < 0;
+#else
+         return mFunc(a, b)->__ToInt() < 0;
+#endif
       }
-      else
-      {
-         ELEM_ *e = (ELEM_ *)mBase;
-         std::stable_sort(e, e+length, Sorter(inSorter) );
-      }
-   }
+   };
+
+   // Defined after class Array below - the body uses Array<Dynamic>, which
+   // is incomplete here and gcc/clang check that at template definition
+   // time (msvc does not)
+   void sort(SorterFunc inSorter);
 
    Dynamic iterator() { return new hx::ArrayIterator<ELEM_,ELEM_>(this); }
    Dynamic keyValueIterator() { return new hx::ArrayKeyValueIterator<ELEM_,ELEM_>(this); }
@@ -1171,6 +1286,67 @@ Array<ELEM_> Array_obj<ELEM_>::__new(int inSize,int inReserve)
 
 
 template<typename ELEM_>
+void Array_obj<ELEM_>::sort(SorterFunc inSorter)
+{
+   if (hx::ArrayValueSortable<ELEM_>::Yes)
+   {
+      // Plain values.  (Dispatching on the StoreType here would send
+      // bool/byte/short arrays through safeSort, which reinterprets the
+      // buffer as Dynamic[] and reads out of bounds.)
+      //
+      // The comparator takes Dynamic arguments, so comparing raw values
+      // directly boxes two of them per comparison - n log n boxes.  Box
+      // each element once, sort an index through the boxed values, then
+      // permute the raw values into place.  The sorter holds the boxed
+      // array for the whole sort.  'boxed' itself is dead once the sort
+      // starts, so an optimised build may keep no copy of it, and with
+      // only a pointer into its buffer a collection in the comparator
+      // freed the boxes.
+      const int n = length;
+      if (n<2)
+         return;
+      Array<Dynamic> boxed(n, n);
+      {
+         ELEM_ *e = (ELEM_ *)mBase;
+         for(int i=0;i<n;i++)
+            boxed->init(i, Dynamic(e[i]));
+      }
+
+      auto index = std::vector<int>(n);
+      for(int i=0;i<n;i++)
+         index[i] = i;
+
+      BoxedSorter sorter(boxed.mPtr, inSorter);
+      hx::StableSort(index.data(), n, sorter);
+
+      // Apply the permutation with cycle-following swaps (see SafeSorter).
+      // The comparator may have run user code, so re-read mBase.  If that
+      // code changed the length, the index describes values that are gone:
+      // leave the array as the comparator left it.
+      if (length!=n)
+         return;
+      ELEM_ *e = (ELEM_ *)mBase;
+      for(int i=0;i<n;i++)
+      {
+         int from = index[i];
+         while (from < i)
+            from = index[from];
+         if (from != i)
+         {
+            std::swap(e[i], e[from]);
+            index[i] = from;
+         }
+      }
+   }
+   else
+   {
+      // Keep references from being hidden inside sorters buffers
+      safeSort(inSorter, (int)hx::ArrayTraits<ELEM_>::StoreType==(int)hx::arrayString);
+   }
+}
+
+
+template<typename ELEM_>
 Array<ELEM_> Array_obj<ELEM_>::__newConstWrapper(ELEM_ *inData,int inSize)
 {
    Array_obj<ELEM_> temp(0,0);
@@ -1208,7 +1384,8 @@ template<typename ELEM_>
 Array<ELEM_> Array_obj<ELEM_>::copy( )
 {
    Array_obj *result = new Array_obj((int)length,0);
-   ::memcpy(result->GetBase(),GetBase(),length*sizeof(ELEM_));
+   if (length)
+      ::memcpy(result->GetBase(),GetBase(),length*sizeof(ELEM_));
    return result;
 }
 
@@ -1237,8 +1414,12 @@ Array<ELEM_> Array_obj<ELEM_>::filter(FilterFunc inFunc)
 {
    Array_obj *result = new Array_obj(0,0);
    for(int i=0;i<length;i++)
-      if (inFunc(__unsafe_get(i)))
-         result->push(__unsafe_get(i));
+   {
+      // The value the predicate saw, even if it changed the slot
+      ELEM_ value = __unsafe_get(i);
+      if (inFunc(value))
+         result->push(value);
+   }
    return result;
 }
 

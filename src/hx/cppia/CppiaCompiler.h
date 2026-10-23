@@ -12,6 +12,10 @@
       #define SLJIT_CONFIG_X86_64 1
    #else
       #define SLJIT_CONFIG_X86_32 1
+      #ifndef _WIN32
+      // The System V i386 ABI has the stack 16-byte aligned at every call
+      #define SLJIT_X86_32_ALIGN_STACK_16 1
+      #endif
    #endif
 #endif
 
@@ -38,7 +42,6 @@ enum JitPosition
    jposFrame,
    jposLocal,
    jposThis,
-   jposArray,
    jposRegister,
    jposStar,
    jposStarReg,

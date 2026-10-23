@@ -158,10 +158,12 @@
   </files>
 
   <files id="hxcpp_zlib_impl" >
+    <options name="Options.txt" ifExists="Options.txt"/>
     <depend files="hxcpp-depends"/>
     <depend name="${this_dir}/Build.xml" dateOnly="true" />
     <depend name="${this_dir}/ZLibCompress.hpp"/>
     <depend name="${this_dir}/ZLibUncompress.hpp"/>
+    <depend name="${this_dir}/ZLibMemory.hpp"/>
 
     <cache value="true" asLibrary="true" />
     <addTwice value="1" />

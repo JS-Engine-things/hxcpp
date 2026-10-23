@@ -2,6 +2,8 @@
 #define HX_STACK_CONTEXT_H
 
 #include "QuickVec.h"
+#include <exception>
+#include <atomic>
 
 #ifdef HXCPP_SINGLE_THREADED_APP
   #define HX_CTX_GET ::hx::gMainThreadContext
@@ -161,7 +163,7 @@
           /* This is incorrect - a read memory barrier is needed here. */     \
           /* For now, just live with the exceedingly rare cases where */      \
           /* breakpoints are missed */                                        \
-          if (::hx::gShouldCallHandleBreakpoints) {                             \
+          if (::hx::gShouldCallHandleBreakpoints.load(std::memory_order_relaxed)) { \
               __hxcpp_on_line_changed(_hx_stackframe.ctx);                    \
          }
       #define HX_STACK_LINE_QUICK(number) _hx_stackframe.lineNumber = number;
@@ -239,7 +241,8 @@ extern const char* EXTERN_CLASS_NAME;
 
 
 #ifdef HXCPP_DEBUGGER
-extern volatile bool gShouldCallHandleBreakpoints;
+// Set from the debugger thread and read on every line by the others
+extern std::atomic<bool> gShouldCallHandleBreakpoints;
 
 
 // These must match the values present in cpp.vm.Debugger
@@ -395,6 +398,19 @@ struct MarkChunk
 
 
 
+#ifdef HXCPP_STACK_TRACE
+// True while a C++ exception unwinds the stack, as it does when a destructor
+// calls back into Haxe during the unwinding
+inline bool hxExceptionUnwinding()
+{
+   #if (defined(_MSVC_LANG) && _MSVC_LANG >= 201703L) || __cplusplus >= 201703L
+   return std::uncaught_exceptions() > 0;
+   #else
+   return std::uncaught_exception();
+   #endif
+}
+#endif
+
 struct StackContext : public hx::ImmixAllocator
 {
    #ifdef HXCPP_STACK_IDS
@@ -406,10 +422,11 @@ struct StackContext : public hx::ImmixAllocator
       hx::QuickVec<hx::ExceptionStackFrame> mExceptionStack;
       // Updated only when a thrown exception unwinds the stack
       bool mIsUnwindingException;
-
-      #ifdef HXCPP_STACK_SCRIPTABLE
-         // TODO - combine CppaCtx and StackContext
-      #endif
+      // A frame entered from a destructor while an exception unwinds, as a
+      // native cleanup callback is: the depth to resume recording at, and
+      // the exception's stack, set aside meanwhile
+      int mUnwindResumeDepth;
+      hx::QuickVec<hx::ExceptionStackFrame> mOuterExceptionStack;
 
       #ifdef HXCPP_DEBUGGER
          DebuggerContext  *mDebugger;
@@ -483,7 +500,15 @@ struct StackContext : public hx::ImmixAllocator
          tlmSampleEnter(mTelemetry,inFrame);
       #endif
 
-      mIsUnwindingException = false;
+      if (mIsUnwindingException)
+      {
+         if (mUnwindResumeDepth<0 && hxExceptionUnwinding())
+         {
+            mUnwindResumeDepth = (int)mStackFrames.size();
+            mOuterExceptionStack.swap(mExceptionStack);
+         }
+         mIsUnwindingException = false;
+      }
       mStackFrames.push(inFrame);
 
       #ifdef HXCPP_DEBUGGER
@@ -506,6 +531,14 @@ struct StackContext : public hx::ImmixAllocator
       }
 
       mStackFrames.pop_back();
+
+      if (mUnwindResumeDepth==(int)mStackFrames.size())
+      {
+         mExceptionStack.swap(mOuterExceptionStack);
+         mOuterExceptionStack.clear();
+         mUnwindResumeDepth = -1;
+         mIsUnwindingException = true;
+      }
    }
 
    void getCurrentCallStackAsStrings(Array<String> result, bool skipLast);
@@ -549,6 +582,10 @@ struct StackContext : public hx::ImmixAllocator
    unsigned char *stack;
    unsigned char *pointer;
    unsigned char *frame;
+   // Overflow limit for the script stack - the true end minus a margin
+   // that covers one frame's argument pushes, which happen before the
+   // callee's stack-size check runs
+   unsigned char *stackEnd;
    class Object  *exception;
 
    unsigned int breakContReturn;
@@ -639,6 +676,12 @@ public:
          // The list of types that can be currently caught in the stack frame.
          StackCatchable *catchables;
          #endif
+      #endif
+
+      #ifdef HXCPP_STACK_SCRIPTABLE
+      // A script function's place on the script stack, from which the
+      // debugger finds its variables
+      unsigned char *scriptStack;
       #endif
 
        // The constructor automatically adds the StackFrame to the list of

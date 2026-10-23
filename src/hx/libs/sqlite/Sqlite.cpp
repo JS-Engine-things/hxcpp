@@ -23,6 +23,7 @@
 #include <hxcpp.h>
 #include "sqlite3.h"
 #include <stdlib.h>
+#include <algorithm>
 
 
 // Put in anon-namespace to avoid conflicts if static-linked
@@ -40,6 +41,9 @@ struct result : public hx::Object
    int count;
    String *names;
    int *bools;
+   // The column for each of a row's fixed fields, which Anon_obj keeps
+   // sorted by name hash
+   int *order;
    int done;
    int first;
 
@@ -53,6 +57,7 @@ struct result : public hx::Object
       ncols = sqlite3_column_count(r);
       names = (String *)malloc(sizeof(String)*ncols);
       bools = (int*)malloc(sizeof(int)*ncols);
+      order = (int*)malloc(sizeof(int)*(ncols > 0 ? ncols : 1));
       first = 1;
       done = 0;
       for(int i=0;i<ncols;i++)
@@ -64,7 +69,10 @@ struct result : public hx::Object
 
          const char *dtype = sqlite3_column_decltype(r,i);
          bools[i] = dtype?(strcmp(dtype,"BOOL") == 0):0;
+         order[i] = i;
       }
+      String *n = names;
+      std::sort(order, order+ncols, [n](int a, int b) { return (int)n[a].hash() < (int)n[b].hash(); });
    }
 
    static void finalize(Dynamic obj) { ((result *)(obj.mPtr))->destroy(false); }
@@ -79,6 +87,11 @@ struct result : public hx::Object
       {
          free(names);
          names = 0;
+      }
+      if (order)
+      {
+         free(order);
+         order = 0;
       }
       if (r)
       {
@@ -230,7 +243,25 @@ void _hx_sqlite_close(Dynamic handle)
 int     _hx_sqlite_last_insert_id(Dynamic handle)
 {
    database *db = getDatabase(handle);
-   return sqlite3_last_insert_rowid(db->db);
+   // The glue signature is Int (matching the haxe std extern) - saturate
+   // instead of silently wrapping a 64-bit rowid
+   sqlite3_int64 id = sqlite3_last_insert_rowid(db->db);
+   if( id > 0x7fffffff )
+      return 0x7fffffff;
+   return (int)id;
+}
+
+/**
+   get_autocommit : 'db -> bool
+   <doc>Whether the database is in autocommit mode, which is to say whether no
+   transaction is open: sqlite3_get_autocommit. A transaction begun or ended
+   with SQL text -- BEGIN, COMMIT, a ROLLBACK SQLite performed itself after an
+   error -- is reflected here as surely as one begun through the API.</doc>
+**/
+bool _hx_sqlite_get_autocommit(Dynamic handle)
+{
+   database *db = getDatabase(handle);
+   return sqlite3_get_autocommit(db->db) != 0;
 }
 
 /**
@@ -316,10 +347,11 @@ Dynamic _hx_sqlite_result_next(Dynamic handle)
    {
       case SQLITE_ROW:
       {
-         hx::Anon v = hx::Anon_obj::Create();
+         hx::Anon v = hx::Anon_obj::Create(r->ncols);
          r->first = 0;
-         for(int i=0;i<r->ncols;i++)
+         for(int slot=0;slot<r->ncols;slot++)
          {
+            int i = r->order[slot];
             Dynamic f;
             switch( sqlite3_column_type(r->r,i) )
             {
@@ -329,7 +361,19 @@ Dynamic _hx_sqlite_result_next(Dynamic handle)
                if( r->bools[i] )
                   f = bool(sqlite3_column_int(r->r,i));
                else
-                  f = int(sqlite3_column_int(r->r,i));
+               {
+                  // INTEGER is 64-bit, and sqlite3_column_int kept the low
+                  // 32: a millisecond timestamp, 1727600000000, read as
+                  // 1023147008. An Int when the value fits one, as every
+                  // value did before, and an Int64 when it does not -- not a
+                  // Float, which is exact only to 2^53, short of a Snowflake
+                  // id or a SUM() of them.
+                  sqlite3_int64 v = sqlite3_column_int64(r->r,i);
+                  if( v >= -2147483647LL - 1 && v <= 2147483647LL )
+                     f = int(v);
+                  else
+                     f = Dynamic( (cpp::Int64)v );
+               }
                break;
             case SQLITE_FLOAT:
                f = Float(sqlite3_column_double(r->r,i));
@@ -349,19 +393,28 @@ Dynamic _hx_sqlite_result_next(Dynamic handle)
                                String((int)sqlite3_column_type(r->r,i)));
                }
             }
-            v->__SetField(r->names[i],f,hx::paccDynamic);
+            v->setFixed(slot,r->names[i],f);
          }
          return v;
       }
       case SQLITE_DONE:
          r->destroy(true);
          return null();
-      case SQLITE_BUSY:
-         hx::Throw(HX_CSTRING("Database is busy"));
-      case SQLITE_ERROR:
-         sqlite_error(r->db);
       default:
-         hx::Throw(HX_CSTRING("Unkown sqlite result"));
+      {
+         // The step failed: finalize now, and ignore what finalize says. With
+         // the legacy sqlite3_prepare this uses, finalize returns the step's
+         // error again, and the statement was left for the next request or
+         // close to finalize with destroy(true) -- which threw that error as
+         // "Could not finalize request", failing the connection's next,
+         // unrelated statement. Finalizing first is also what gives SQLite's
+         // own message: the step's is only "SQL logic error".
+         sqlite3 *db = r->db;
+         r->destroy(false);
+         if( step == SQLITE_BUSY || step == SQLITE_LOCKED )
+            hx::Throw( HX_CSTRING("Database is busy : ") + String(sqlite3_errmsg(db)) );
+         sqlite_error(db);
+      }
    }
 
    return null();

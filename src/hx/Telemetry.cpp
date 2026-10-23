@@ -76,6 +76,19 @@ public:
 
     ~Telemetry()
     {
+        // Restarting telemetry, or a thread exiting, deletes a Telemetry
+        // whose recorded objects are still to be collected
+        {
+            std::lock_guard<std::recursive_mutex> lock(alloc_mutex);
+            for (std::map<void*, Telemetry*>::iterator iter = alloc_map.begin(); iter != alloc_map.end(); )
+            {
+                if (iter->second == this)
+                    alloc_map.erase(iter++);
+                else
+                    ++iter;
+            }
+        }
+
         std::lock_guard<std::recursive_mutex> lock(gThreadMutex);
 
         gThreadRefCount -= 1;
@@ -204,7 +217,11 @@ public:
       std::map<void*, hx::Telemetry*>::iterator exist = alloc_map.find(_last_obj);
       if (exist != alloc_map.end() && _last_obj!=(NULL)) {
         type = "_unknown";
-        int vtt = _last_obj->__GetType();
+        // The object is looked up when the NEXT allocation is tracked, which can come before its
+        // constructor has run (Array::__copy allocates its buffer first). New memory is zeroed, so
+        // a null vtable means it is not an object yet.
+        int vtt = *(void**)_last_obj == 0 ? -1 : _last_obj->__GetType();
+        if (vtt == -1) type = "_unconstructed";
         if (vtt==vtInt || vtt==vtFloat || vtt==vtBool) type = "_non_class";
         else if (vtt==vtObject ||
                  vtt==vtString ||
@@ -472,8 +489,8 @@ void hx::Telemetry::HXTAllocation(void* obj, size_t inSize, const char* type)
     // for every external call, hashes for every SDL event (Lime's
     // ExternalInterface.external_handler()), etc
 #ifndef HXCPP_PROFILE_EXTERNS
-    if (stack->getCurrentStackFrame()->position->className==hx::EXTERN_CLASS_NAME) {
-      alloc_mutex.unlock();
+    // alloc_mutex is not locked yet, and an empty stack has no current frame.
+    if (stack->getDepth() > 0 && stack->getCurrentStackFrame()->position->className==hx::EXTERN_CLASS_NAME) {
       return;
     }
 #endif
@@ -487,9 +504,8 @@ void hx::Telemetry::HXTAllocation(void* obj, size_t inSize, const char* type)
     std::map<void*, hx::Telemetry*>::iterator exist = alloc_map.find(obj);
     if (exist != alloc_map.end()) {
       printf("HXT ERR: Object id collision! at on %016lx, id=%016lx\n", obj, obj_id);
+      alloc_mutex.unlock();
       throw "uh oh";
-      alloc_mutex.Unlock();
-      return;
     }
 #endif
 

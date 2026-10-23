@@ -6,14 +6,18 @@ test/ndlls/cpp
 test/ndlls/cpp64
 test/std/arm32
 test/std/arm64
+test/std/android
 test/std/cpp32
 test/std/cpp64
 test/std/mybase.db
+test/gc_stress/bin-*
+test/cppia/host_classes.info
 test/std/hxcpp.db
 test/opMatrix/Ops.hx
 test/opMatrix/cpp
 test/haxe/cpp
 test/telemetry/cpp
+test/anon/cpp
 test/extern-lib/gen-externs
 test/cffi/project/ndll
 test/snippets/messagebox/cpp
@@ -438,3 +442,12 @@ FodyWeavers.xsd
 # Additional files built by Visual Studio
 
 # End of https://www.toptal.com/developers/gitignore/api/visualstudio
+
+# The release tool, which the Visual Studio rules above would ignore
+!tools/release/
+
+# hxcpp compile cache used by CI
+/.hxcpp-cache/
+
+# Benchmark builds and per-runtime haxelib repositories
+/bench/.work/

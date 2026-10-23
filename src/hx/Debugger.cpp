@@ -8,7 +8,10 @@
 #include <hx/OS.h>
 #include <hx/QuickVec.h>
 #include <hx/thread/Thread.hpp>
+#include <atomic>
 #include <mutex>
+#include <thread>
+#include <atomic>
 
 // Newer versions of haxe compiler will set these too (or might be null for haxe 3.0)
 static const char **__all_files_fullpath = 0;
@@ -28,11 +31,10 @@ extern const char *__hxcpp_all_files[];
 // This global boolean is set whenever there are any breakpoints (normal or
 // immediate), and can relatively quickly gate debugged threads from making
 // more expensive breakpoint check calls when there are no breakpoints set.
-// Note that there is no lock to protect this.  Volatile is used to ensure
-// that within a function call, the value of gShouldCallHandleBreakpoints is
-// not cached in a register and thus not properly checked within the function
-// call.
-volatile bool gShouldCallHandleBreakpoints = false;
+// Note that there is no lock to protect this. It is atomic so the threads
+// that read it on every line see the debugger thread's writes, with relaxed
+// loads that cost what the old volatile reads did.
+std::atomic<bool> gShouldCallHandleBreakpoints(false);
 
 // This is the event notification handler, as registered by the debugger
 // thread.
@@ -69,25 +71,27 @@ static unsigned int g_debugThreadNumber = -1;
 ExecutionTrace sExecutionTrace = exeTraceOff;
 
 
-// These should implement write and read memory barrier, but since there are
-// no obvious portable implementations, they are currently left unimplemented
 static void write_memory_barrier()
 {
-    // currently unimplemented
+    std::atomic_thread_fence(std::memory_order_release);
 }
 
 static void read_memory_barrier()
 {
-    // currently unimplemented
+    std::atomic_thread_fence(std::memory_order_acquire);
 }
 
 
 const char *_hx_dbg_find_scriptable_class_name(String className);
 
 
-static std::mutex gMutex;
-static std::map<int, DebuggerContext *> gMap;
-static std::list<DebuggerContext *> gList;
+// Never destroyed: a thread's context leaves them as the thread ends, and a
+// thread can end while the main thread, having returned from main, runs the
+// static destructors. That goes for the mutex too: libc++ destroys the
+// pthread mutex, and locking it afterwards throws, which aborts the process.
+static std::mutex &gMutex = *new std::mutex();
+static std::map<int, DebuggerContext *> &gMap = *new std::map<int, DebuggerContext *>();
+static std::list<DebuggerContext *> &gList = *new std::list<DebuggerContext *>();
 
 class Breakpoints;
 Breakpoints *ReleaseBreakpointsLocked(Breakpoints *inBreakpoints);
@@ -104,6 +108,10 @@ public:
    DebugStatus  mStatus;
    int          mStepLevel;
    Breakpoints  *mBreakpoints;
+
+   // Running the stop handler: the thread counts as stopped, but its stack
+   // still changes until the handler returns
+   std::atomic<bool> mInHandler;
 
    // Waiting for continue
    bool         mWaiting;
@@ -153,6 +161,10 @@ public:
    void detach()
    {
       mAttached = false;
+      // Capture before reset() overwrites it with -1 - every terminate
+      // event used to report thread -1, so debug adapters could never
+      // remove the right thread from their lists
+      int terminatedThread = mThreadNumber;
       gMutex.lock();
       gList.remove(this);
       gMap.erase(mThreadNumber);
@@ -162,7 +174,7 @@ public:
 
       Dynamic handler = hx::g_eventNotificationHandler;
       if (handler != null())
-         handler(mThreadNumber, hx::THREAD_TERMINATED);
+         handler(terminatedThread, hx::THREAD_TERMINATED);
    }
 
    void enable(bool inEnable)
@@ -172,6 +184,7 @@ public:
 
    void reset()
    {
+      mInHandler = false;
       mCanStop = false;
       mBreakpoint = 0;
       mBreakpoints = 0;
@@ -224,7 +237,11 @@ public:
         int i = 0;
         while (i < size) {
             gMutex.lock();
-            DebuggerContext *stack = gMap[threadNumbers[i]];
+            // find(), not operator[] - the lookup for a thread that went
+            // away used to insert a permanent NULL entry that the other
+            // gMap readers then dereferenced
+            std::map<int, DebuggerContext *>::iterator found = gMap.find(threadNumbers[i]);
+            DebuggerContext *stack = found==gMap.end() ? 0 : found->second;
             if (!stack) {
                 // The thread went away while we were working!
                 gMutex.unlock();
@@ -242,8 +259,13 @@ public:
                 return;
             }
             // Sleep for 1/10 of a second on a semaphore that will never
-            // be Set.
+            // be Set.  In the free zone: the stopping threads run the
+            // stop handler, which allocates - a collection during this
+            // wait must not block on the debugger thread (whole-process
+            // stall until the 2s timeout)
+            hx::EnterGCFreeZone();
             timeoutSem.WaitSeconds(0.100);
+            hx::ExitGCFreeZone();
             timeSlicesLeft -= 1;
             // Don't increment i, try the same thread again
         }
@@ -291,10 +313,28 @@ public:
         StackFrame *frame = mStackContext->getCurrentStackFrame();
         // Record this before g_eventNotificationHandler is run, since it might change in there
         mStackContext->mDebugger->mStepLevel = mStackContext->getDepth();
-        g_eventNotificationHandler
-            (mThreadNumber, THREAD_STOPPED, mStackContext->mDebugger->mStepLevel,
-             String(frame->position->className), String(frame->position->functionName),
-             String(frame->position->fileName), frame->lineNumber);
+        // Latch and null-check like every other caller - a detach racing
+        // this break otherwise calls a null Dynamic from user code
+        {
+            Dynamic stopHandler = g_eventNotificationHandler;
+            if (stopHandler == null())
+            {
+                mWaitMutex.lock();
+                mWaiting = false;
+                mWaitMutex.unlock();
+                mStatus = DBG_STATUS_RUNNING;
+                mCanStop = true;
+                return;
+            }
+            // The handler runs Haxe code on this thread, so the debugger
+            // waits for it before reading this thread's stack
+            mInHandler = true;
+            stopHandler
+                (mThreadNumber, THREAD_STOPPED, mStackContext->mDebugger->mStepLevel,
+                 String(frame->position->className), String(frame->position->functionName),
+                 String(frame->position->fileName), frame->lineNumber);
+            mInHandler = false;
+        }
 
         if (mWaiting)
         {
@@ -384,16 +424,20 @@ public:
         gMutex.lock();
 
         int ret = gNextBreakpointNumber++;
-        
+
         Breakpoints *newBreakpoints = new Breakpoints(gBreakpoints, ret, fileName, lineNumber);
-        
-        gBreakpoints->RemoveRef();
 
         // Write memory barrier ensures that newBreakpoints values are updated
         // before gBreakpoints is assigned to it
         write_memory_barrier();
 
+        // Publish before releasing the old object (matching Delete) - with
+        // no cached thread references RemoveRef deletes immediately, and
+        // unlocked readers could dereference the freed object through the
+        // still-pointing global
+        Breakpoints *toRelease = gBreakpoints;
         gBreakpoints = newBreakpoints;
+        toRelease->RemoveRef();
 
         // Don't need a write memory barrier here, it's harmless to see
         // gShouldCallHandleBreakpoints update before gBreakpoints has updated
@@ -422,16 +466,17 @@ public:
         gMutex.lock();
 
         int ret = gNextBreakpointNumber++;
-        
+
         Breakpoints *newBreakpoints = new Breakpoints(gBreakpoints, ret, className, functionName);
-        
-        gBreakpoints->RemoveRef();
 
         // Write memory barrier ensures that newBreakpoints values are updated
         // before gBreakpoints is assigned to it
         write_memory_barrier();
 
+        // Publish before releasing the old object (see the file:line Add)
+        Breakpoints *toRelease = gBreakpoints;
         gBreakpoints = newBreakpoints;
+        toRelease->RemoveRef();
 
         // Don't need a write memory barrier here, it's harmless to see
         // gShouldCallHandleBreakpoints update before gBreakpoints has updated
@@ -445,16 +490,17 @@ public:
     static void DeleteAll()
     {
         gMutex.lock();
-        
-        Breakpoints *newBreakpoints = new Breakpoints();
 
-        gBreakpoints->RemoveRef();
+        Breakpoints *newBreakpoints = new Breakpoints();
 
         // Write memory barrier ensures that newBreakpoints values are updated
         // before gBreakpoints is assigned to it
         write_memory_barrier();
 
+        // Publish before releasing the old object (see the file:line Add)
+        Breakpoints *toRelease = gBreakpoints;
         gBreakpoints = newBreakpoints;
+        toRelease->RemoveRef();
 
         // Don't need a write memory barrier here, it's harmless to see
         // gShouldCallHandleBreakpoints update before gStepType has updated
@@ -670,9 +716,12 @@ public:
         // If the break was an immediate break, and there was a step count,
         // just decrement the step count
         if (breakStatus == DBG_STATUS_STOPPED_BREAK_IMMEDIATE) {
-            if (gStepCount > 1) {
-                gStepCount -= 1;
-                return;
+            // CAS loop - with gStepThread==-1 several threads decrement
+            // concurrently and a plain read-modify-write lost counts
+            int count = gStepCount.load();
+            while (count > 1) {
+                if (gStepCount.compare_exchange_weak(count, count - 1))
+                    return;
             }
         }
 
@@ -683,7 +732,10 @@ public:
 
       static bool shoudBreakOnLine()
       {
-         return gBreakpoints->IsEmpty() || gStepType != hx::STEP_NONE;
+         // Was inverted: toggling execution trace with breakpoints set
+         // silently disabled every breakpoint, and with none set it pinned
+         // the per-line handler on forever
+         return !gBreakpoints->IsEmpty() || gStepType != hx::STEP_NONE;
       }
 
 private:
@@ -935,20 +987,23 @@ private:
 
     static int gNextBreakpointNumber;
     static Breakpoints * volatile gBreakpoints;
-    static StepType gStepType;
-    static int gStepLevel;
-    static int gStepThread; // If -1, all threads are targeted
-    static int gStepCount;
+    // Atomic: written by the debugger thread, read (and for gStepCount,
+    // read-modify-written) concurrently by every debugged thread - plain
+    // ints lost updates and tore on weakly ordered targets
+    static std::atomic<int> gStepType;
+    static std::atomic<int> gStepLevel;
+    static std::atomic<int> gStepThread; // If -1, all threads are targeted
+    static std::atomic<int> gStepCount;
 };
 
 
 
 /* static */ int Breakpoints::gNextBreakpointNumber;
 /* static */ Breakpoints * volatile Breakpoints::gBreakpoints = new Breakpoints();
-/* static */ StepType Breakpoints::gStepType = STEP_NONE;
-/* static */ int Breakpoints::gStepLevel;
-/* static */ int Breakpoints::gStepThread = -1;
-/* static */ int Breakpoints::gStepCount = -1;
+/* static */ std::atomic<int> Breakpoints::gStepType(STEP_NONE);
+/* static */ std::atomic<int> Breakpoints::gStepLevel(0);
+/* static */ std::atomic<int> Breakpoints::gStepThread(-1);
+/* static */ std::atomic<int> Breakpoints::gStepCount(-1);
 
 
 Breakpoints *ReleaseBreakpointsLocked(Breakpoints *inBreakpoints)
@@ -962,22 +1017,50 @@ Breakpoints *ReleaseBreakpointsLocked(Breakpoints *inBreakpoints)
 
 
 // Gets a ThreadInfo for a thread
+// A thread announces a stop by running the stop handler on its own stack,
+// which pushes and pops frames, so the stack holds still only once the handler
+// has returned. A handler that asks about its own thread does not wait.
+static void WaitWhileInStopHandler(int threadNumber)
+{
+    if (threadNumber == (int)hx::thread::Thread_obj::id())
+        return;
+    for (;;)
+    {
+        bool inHandler = false;
+        gMutex.lock();
+        std::map<int, DebuggerContext *>::iterator found = gMap.find(threadNumber);
+        if (found != gMap.end())
+            inHandler = found->second->mInHandler;
+        gMutex.unlock();
+        if (!inHandler)
+            return;
+        hx::EnterGCFreeZone();
+        std::this_thread::yield();
+        hx::ExitGCFreeZone();
+    }
+}
+
 static Dynamic GetThreadInfo(int threadNumber, bool unsafe)
 {
     if (threadNumber == g_debugThreadNumber)
         return null();
 
+    if (!unsafe)
+        WaitWhileInStopHandler(threadNumber);
+
     DebuggerContext *stack = 0;
 
     gMutex.lock();
 
-    if (gMap.count(threadNumber) == 0)
+    {
+        std::map<int, DebuggerContext *>::iterator found = gMap.find(threadNumber);
+        stack = found==gMap.end() ? 0 : found->second;
+    }
+    if (!stack)
     {
         gMutex.unlock();
         return null();
     }
-    else
-        stack = gMap[threadNumber];
 
     if ((stack->mStatus == DBG_STATUS_RUNNING) && !unsafe)
     {
@@ -1000,13 +1083,15 @@ static Dynamic GetThreadInfo(int threadNumber, bool unsafe)
     for (int i = 0; i < size; i++)
     {
        StackFrame *frame = stack->mStackContext->getStackFrame(i);
+       // The line number parameter is an Int - stringifying it only worked
+       // by accident through a String->atoi round trip per frame
        #ifdef HXCPP_STACK_LINE
          Dynamic info = g_newStackFrameFunction
-              (String(frame->position->fileName), String(frame->lineNumber),
+              (String(frame->position->fileName), (int)frame->lineNumber,
                String(frame->position->className), String(frame->position->functionName));
        #else
          Dynamic info = g_newStackFrameFunction
-              (String(frame->position->fileName), String(frame->position->firstLineNumber),
+              (String(frame->position->fileName), (int)frame->position->firstLineNumber,
                String(frame->position->className), String(frame->position->functionName));
        #endif
 
@@ -1051,7 +1136,21 @@ static ::Array<Dynamic> GetStackVariables(int threadNumber,
                                           bool unsafe,
                                           Dynamic markThreadNotStopped)
 {
+    if (!unsafe)
+        WaitWhileInStopHandler(threadNumber);
+
     ::Array<Dynamic> ret = Array_obj<Dynamic>::__new();
+
+    // Collect the name pointers under the lock and allocate after
+    // releasing it: a collection triggered by the String/push allocations
+    // can block waiting on a running thread that is itself blocked on
+    // gMutex inside HandleBreakpoints - a whole-process deadlock.  The
+    // stopped thread's frame is stable, so the pointers stay valid
+    std::vector<const char *> names;
+    bool notStopped = false;
+    #ifdef HXCPP_STACK_SCRIPTABLE
+    StackFrame *scriptFrame = 0;
+    #endif
 
     gMutex.lock();
 
@@ -1060,32 +1159,42 @@ static ::Array<Dynamic> GetStackVariables(int threadNumber,
         DebuggerContext *ctx = *iter++;
         if (ctx->mThreadNumber == threadNumber) {
             if ((ctx->mStatus == DBG_STATUS_RUNNING) && !unsafe) {
-                ret->push(markThreadNotStopped);
-                gMutex.unlock();
-                return ret;
+                notStopped = true;
+                break;
             }
             StackContext *stack = ctx->mStackContext;
             // Some kind of error signalling here would be nice I guess
             if (stack->mStackFrames.size() <= stackFrameNumber) {
                 break;
             }
-            StackVariable *variable = 
+            StackVariable *variable =
                 stack->mStackFrames[stackFrameNumber]->variables;
             while (variable) {
-                ret->push(String(variable->mHaxeName));
+                names.push_back(variable->mHaxeName);
                 variable = variable->mNext;
             }
 
             #ifdef HXCPP_STACK_SCRIPTABLE
-            StackFrame *scriptFrame = stack->mStackFrames[stackFrameNumber];
-            if (scriptFrame)
-               __hxcpp_dbg_getScriptableVariables(scriptFrame, ret);
+            scriptFrame = stack->mStackFrames[stackFrameNumber];
             #endif
             break;
         }
     }
 
     gMutex.unlock();
+
+    if (notStopped) {
+        ret->push(markThreadNotStopped);
+        return ret;
+    }
+
+    for (size_t i = 0; i < names.size(); i++)
+        ret->push(String(names[i]));
+
+    #ifdef HXCPP_STACK_SCRIPTABLE
+    if (scriptFrame)
+       __hxcpp_dbg_getScriptableVariables(scriptFrame, ret);
+    #endif
 
     return ret;
 }
@@ -1095,6 +1204,9 @@ static Dynamic GetVariableValue(int threadNumber, int stackFrameNumber,
                                 Dynamic markNonexistent,
                                 Dynamic markThreadNotStopped)
 {
+    if (!unsafe)
+        WaitWhileInStopHandler(threadNumber);
+
     if (threadNumber == g_debugThreadNumber) {
         return markNonexistent;
     }
@@ -1103,12 +1215,13 @@ static Dynamic GetVariableValue(int threadNumber, int stackFrameNumber,
 
     gMutex.lock();
 
-    if (gMap.count(threadNumber) == 0) {
+    {
+        std::map<int, DebuggerContext *>::iterator found = gMap.find(threadNumber);
+        ctx = found==gMap.end() ? 0 : found->second;
+    }
+    if (!ctx) {
         gMutex.unlock();
         return markNonexistent;
-    }
-    else {
-        ctx = gMap[threadNumber];
     }
 
     if ((ctx->mStatus == DBG_STATUS_RUNNING) && !unsafe) {
@@ -1158,6 +1271,9 @@ static Dynamic SetVariableValue(int threadNumber, int stackFrameNumber,
                                 bool unsafe, Dynamic markNonexistent,
                                 Dynamic markThreadNotStopped)
 {
+    if (!unsafe)
+        WaitWhileInStopHandler(threadNumber);
+
     if (threadNumber == g_debugThreadNumber) {
         return null();
     }
@@ -1166,12 +1282,13 @@ static Dynamic SetVariableValue(int threadNumber, int stackFrameNumber,
 
     gMutex.lock();
 
-    if (gMap.count(threadNumber) == 0) {
+    {
+        std::map<int, DebuggerContext *>::iterator found = gMap.find(threadNumber);
+        ctx = found==gMap.end() ? 0 : found->second;
+    }
+    if (!ctx) {
         gMutex.unlock();
         return null();
-    }
-    else {
-        ctx = gMap[threadNumber];
     }
 
     if ((ctx->mStatus == DBG_STATUS_RUNNING) && !unsafe) {
@@ -1472,7 +1589,7 @@ Dynamic __hxcpp_dbg_checkedThrow(Dynamic toThrow)
     if (!hx::CanBeCaught(toThrow))
         hx::CriticalError(HX_CSTRING("Uncatchable Throw: ") + toThrow->toString(),true);
 
-    return hx::Throw(toThrow);
+    hx::Throw(toThrow);
 }
 
 
@@ -1481,16 +1598,16 @@ Dynamic __hxcpp_dbg_checkedRethrow(Dynamic toThrow)
     if (!hx::CanBeCaught(toThrow))
         hx::CriticalError(HX_CSTRING("Uncatchable Throw: ") + toThrow->toString(),true);
 
-    return hx::Rethrow(toThrow);
+    hx::Rethrow(toThrow);
 }
 
 
 
 void __hxcpp_on_line_changed(hx::StackContext *stack)
 {
+   // HandleBreakpoints already traces when exeTraceLines is on - tracing
+   // here as well logged every executed line twice
    hx::Breakpoints::HandleBreakpoints(stack);
-   if (hx::sExecutionTrace==hx::exeTraceLines)
-      stack->tracePosition();
 }
 
 

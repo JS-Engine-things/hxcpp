@@ -1,9 +1,15 @@
 #include <hxcpp.h>
 #include <semaphore.h>
-#include <sys/time.h>
+#include <time.h>
 #include <memory>
 #include <cerrno>
+#include <hx/Thread.h>
 #include <hx/thread/CountingSemaphore.hpp>
+
+// sem_timedwait takes a deadline on the wall clock, which changing the system time moves
+#if (defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 30))) || (defined(__ANDROID__) && __ANDROID_API__ >= 30)
+#define HX_SEM_CLOCKWAIT
+#endif
 
 struct hx::thread::CountingSemaphore_obj::Impl
 {
@@ -21,6 +27,8 @@ hx::thread::CountingSemaphore_obj::CountingSemaphore_obj(int value) : impl(new I
 {
 	if (0 != (sem_init(&impl->semaphore, false, value)))
 	{
+		delete impl;
+		impl = nullptr;
 		hx::Throw(HX_CSTRING("Failed to create semaphore"));
 	}
 
@@ -29,9 +37,27 @@ hx::thread::CountingSemaphore_obj::CountingSemaphore_obj(int value) : impl(new I
 
 void hx::thread::CountingSemaphore_obj::acquire()
 {
+	// Uncontended fast path - skip the GC free zone unless we will block.
+	// A thread that only ever takes the semaphore uncontended, allocating
+	// nothing, otherwise never reaches a safe point, and a collection waits
+	// for it for ever.
+	if (hx::gPauseForCollect)
+		__hxcpp_gc_safe_point();
+	if (0 == sem_trywait(&impl->semaphore))
+		return;
+
 	hx::EnterGCFreeZone();
 
-	if (0 != sem_wait(&impl->semaphore))
+	// sem_wait is never restarted after a caught signal, regardless of
+	// SA_RESTART - retry on EINTR rather than throwing spuriously
+	int r;
+	do
+	{
+		r = sem_wait(&impl->semaphore);
+	}
+	while (0 != r && EINTR == errno);
+
+	if (0 != r)
 	{
 		hx::ExitGCFreeZone();
 		hx::Throw(HX_CSTRING("Failed to wait on semaphore"));
@@ -50,7 +76,10 @@ void hx::thread::CountingSemaphore_obj::release()
 
 bool hx::thread::CountingSemaphore_obj::tryAcquire(Null<double> timeout)
 {
-	if (0 == timeout.Default(0))
+	if (hx::gPauseForCollect)
+		__hxcpp_gc_safe_point();
+	double seconds = timeout.Default(0);
+	if (!(seconds > 0))
 	{
 		return 0 == sem_trywait(&impl->semaphore);
 	}
@@ -58,20 +87,28 @@ bool hx::thread::CountingSemaphore_obj::tryAcquire(Null<double> timeout)
 	{
 		hx::EnterGCFreeZone();
 
-		struct timeval tv;
 		struct timespec t;
-		auto delta = timeout.value;
-		int idelta = (int)delta, idelta2;
-		delta -= idelta;
-		delta *= 1.0e9;
-		gettimeofday(&tv, NULL);
-		delta += tv.tv_usec * 1000.0;
-		idelta2 = (int)(delta / 1e9);
-		delta -= idelta2 * 1e9;
-		t.tv_sec = tv.tv_sec + idelta + idelta2;
-		t.tv_nsec = (long)delta;
+		#ifdef HX_SEM_CLOCKWAIT
+		clock_gettime(CLOCK_MONOTONIC, &t);
+		#else
+		clock_gettime(CLOCK_REALTIME, &t);
+		#endif
+		HxAddSeconds(t, seconds);
 
-		if (0 == sem_timedwait(&impl->semaphore, &t))
+		// Retry on EINTR - the absolute deadline keeps the timeout intact
+		int r;
+		do
+		{
+			#ifdef HX_SEM_CLOCKWAIT
+			r = sem_clockwait(&impl->semaphore, CLOCK_MONOTONIC, &t);
+			#else
+			r = sem_timedwait(&impl->semaphore, &t);
+			#endif
+		}
+		while (0 != r && EINTR == errno);
+		int error = errno;
+
+		if (0 == r)
 		{
 			hx::ExitGCFreeZone();
 			return true;
@@ -79,7 +116,7 @@ bool hx::thread::CountingSemaphore_obj::tryAcquire(Null<double> timeout)
 		else
 		{
 			hx::ExitGCFreeZone();
-			if (errno == ETIMEDOUT)
+			if (error == ETIMEDOUT)
 			{
 				return false;
 			}

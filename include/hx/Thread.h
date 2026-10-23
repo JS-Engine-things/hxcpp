@@ -28,9 +28,16 @@
 #include <errno.h>
 #include <pthread.h>
 #include <sys/time.h>
+#include <time.h>
 #include <stdio.h>
+#ifdef __APPLE__
+#include <mach/mach_time.h>
+#endif
 #define HXCPP_PTHREADS
 #endif
+
+#include <cmath>
+#include <limits>
 
 #ifdef RegisterClass
 #undef RegisterClass
@@ -38,6 +45,14 @@
 
 #if defined(HX_WINDOWS)
 
+inline DWORD HxWaitMilliseconds(double inSeconds)
+{
+   if (!(inSeconds > 0))
+      return 0;
+   // double->DWORD is undefined past 2^32 (and 0xffffffff is INFINITE)
+   double ms = std::ceil(inSeconds*1000.0);
+   return ms >= 4294967294.0 ? 4294967294u : (DWORD)ms;
+}
 
 struct HxMutex
 {
@@ -74,7 +89,14 @@ struct HxMutex
 
 inline bool HxCreateDetachedThread(DWORD (WINAPI *func)(void *), void *param)
 {
-	return (CreateThread(NULL, 0, func, param, 0, 0) != 0);
+	// Close the handle immediately (the Windows detach idiom) - keeping it
+	// leaked one kernel thread object per Thread.create for the process
+	// lifetime
+	HANDLE h = CreateThread(NULL, 0, func, param, 0, 0);
+	if (!h)
+		return false;
+	CloseHandle(h);
+	return true;
 }
 
 #else
@@ -126,13 +148,17 @@ inline bool HxCreateDetachedThread(void *(*func)(void *), void *param)
 		return false;
 #ifdef PTHREAD_CREATE_DETACHED
 	if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0)
+	{
+		pthread_attr_destroy(&attr);
 		return false;
+	}
 #endif
-	if (pthread_create(&t, &attr, func, param) != 0 )
-		return false;
-	if (pthread_attr_destroy(&attr) != 0)
-		return false;
-	return true;
+	bool ok = pthread_create(&t, &attr, func, param) == 0;
+	// Destroy unconditionally and ignore the result: reporting failure
+	// after a successful create would make the caller tear down state
+	// the already-running thread is using
+	pthread_attr_destroy(&attr);
+	return ok;
 }
 
 #endif
@@ -179,10 +205,11 @@ struct HxSemaphore
     // Returns true on success, false on timeout
    bool WaitSeconds(double inSeconds)
    {
+      DWORD waitMs = HxWaitMilliseconds(inSeconds);
       #ifdef HX_WINRT
-      return WaitForSingleObjectEx(mSemaphore,inSeconds*1000.0,false) != WAIT_TIMEOUT;
+      return WaitForSingleObjectEx(mSemaphore,waitMs,false) != WAIT_TIMEOUT;
       #else
-      return WaitForSingleObject(mSemaphore,inSeconds*1000.0) != WAIT_TIMEOUT;
+      return WaitForSingleObject(mSemaphore,waitMs) != WAIT_TIMEOUT;
       #endif
    }
    void Reset() { ResetEvent(mSemaphore); }
@@ -196,6 +223,39 @@ struct HxSemaphore
 
 #define HX_THREAD_SEMAPHORE_LOCKABLE
 
+// Timed waits run on a clock that changing the system time does not move.
+// Apple has no condition clock, so it waits for the time left instead.
+#if !defined(__APPLE__) && (!defined(__ANDROID__) || __ANDROID_API__ >= 21)
+#define HX_THREAD_COND_MONOTONIC
+#endif
+
+inline void HxAddSeconds(timespec &ioTime, double inSeconds)
+{
+   if (!(inSeconds > 0))
+      return;
+   time_t sec = 0x7ffffffe;
+   long nsec = 0;
+   if (inSeconds < sec)
+   {
+      double whole = std::floor(inSeconds);
+      sec = (time_t)whole;
+      nsec = (long)std::ceil((inSeconds - whole)*1000000000.0);
+   }
+   ioTime.tv_nsec += nsec;
+   if (ioTime.tv_nsec >= 1000000000)
+   {
+      ioTime.tv_nsec -= 1000000000;
+      sec++;
+   }
+   if (sec > std::numeric_limits<time_t>::max() - ioTime.tv_sec)
+   {
+      ioTime.tv_sec = std::numeric_limits<time_t>::max();
+      ioTime.tv_nsec = 999999999;
+   }
+   else
+      ioTime.tv_sec += sec;
+}
+
 struct HxSemaphore
 {
    HxMutex         mMutex;
@@ -207,7 +267,15 @@ struct HxSemaphore
    {
       mSet = false;
       mCondition = new pthread_cond_t();
+      #ifdef HX_THREAD_COND_MONOTONIC
+      pthread_condattr_t attr;
+      pthread_condattr_init(&attr);
+      pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+      pthread_cond_init(mCondition,&attr);
+      pthread_condattr_destroy(&attr);
+      #else
       pthread_cond_init(mCondition,0);
+      #endif
    }
    ~HxSemaphore()
    {
@@ -249,28 +317,53 @@ struct HxSemaphore
          pthread_cond_wait( mCondition, mMutex.mMutex );
       mSet = false;
    }
+   static void Now(timespec &outNow)
+   {
+      #ifdef __APPLE__
+      static mach_timebase_info_data_t timebase;
+      if (!timebase.denom)
+         mach_timebase_info(&timebase);
+      unsigned long long ns = mach_absolute_time() * timebase.numer / timebase.denom;
+      outNow.tv_sec = ns / 1000000000;
+      outNow.tv_nsec = ns % 1000000000;
+      #elif defined(HX_THREAD_COND_MONOTONIC)
+      clock_gettime(CLOCK_MONOTONIC, &outNow);
+      #else
+      clock_gettime(CLOCK_REALTIME, &outNow);
+      #endif
+   }
+   int TimedWait(const timespec &inDeadline)
+   {
+      #ifdef __APPLE__
+      timespec now;
+      Now(now);
+      timespec left;
+      left.tv_sec = inDeadline.tv_sec - now.tv_sec;
+      left.tv_nsec = inDeadline.tv_nsec - now.tv_nsec;
+      if (left.tv_nsec<0)
+      {
+         left.tv_nsec += 1000000000;
+         left.tv_sec--;
+      }
+      if (left.tv_sec<0)
+         return ETIMEDOUT;
+      return pthread_cond_timedwait_relative_np( mCondition, mMutex.mMutex, &left );
+      #else
+      return pthread_cond_timedwait( mCondition, mMutex.mMutex, &inDeadline );
+      #endif
+   }
    // Returns true if the wait was success, false on timeout.
    bool WaitSeconds(double inSeconds)
    {
-      struct timeval tv;
-      gettimeofday(&tv, 0);
-
-      int isec = (int)inSeconds;
-      int usec = (int)((inSeconds-isec)*1000000.0);
       timespec spec;
-      spec.tv_nsec = (tv.tv_usec + usec) * 1000;
-      if (spec.tv_nsec>1000000000)
-      {
-         spec.tv_nsec-=1000000000;
-         isec++;
-      }
-      spec.tv_sec = tv.tv_sec + isec;
+      Now(spec);
+      HxAddSeconds(spec, inSeconds);
 
       AutoLock lock(mMutex);
 
       int result = 0;
       // Wait for set to be true...
-      while( !mSet &&  (result=pthread_cond_timedwait( mCondition, mMutex.mMutex, &spec )) != ETIMEDOUT)
+      while( !mSet &&  (result=TimedWait(spec)) != ETIMEDOUT)
       {
          if (result!=0)
          {

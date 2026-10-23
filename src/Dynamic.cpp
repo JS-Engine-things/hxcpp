@@ -2,6 +2,7 @@
 #include <math.h>
 #include <hxMath.h>
 #include <stdio.h>
+#include <atomic>
 
 using namespace hx;
 
@@ -184,7 +185,9 @@ public:
 
    int __Compare(const hx::Object *inRHS) const HXCPP_OVERRIDE
    {
-      double rval = inRHS->__ToInt64();
+      // Compare as Int64 - going through double loses precision above 2^53,
+      // making distinct large values compare equal
+      cpp::Int64 rval = inRHS->__ToInt64();
       if (rval==mValue)
          return 0;
 
@@ -336,21 +339,36 @@ Dynamic CreateDynamicStruct(const void *inValue, int inSize, DynamicHandlerFunc 
 
 // --- Dynamic -------------------------------------------------
 
-Dynamic sConstDynamicInts[256+1];
+// Boxed values from -1 to 255, made once and shared by every thread. A slot is
+// published with a release and read with an acquire, so a thread that finds a
+// box also sees it built. Two threads may both make one: the first is kept, and
+// the other is a small constant allocation that is never used.
+static std::atomic<hx::Object *> sConstDynamicInts[256+1];
+static std::atomic<hx::Object *> sConstDynamicInt64s[256+1];
+
+template<typename DATA>
+static hx::Object *constBox(std::atomic<hx::Object *> &ioSlot, int inVal)
+{
+   hx::Object *result = ioSlot.load(std::memory_order_acquire);
+   if (!result)
+   {
+      hx::Object *made = new (hx::NewObjConst)DATA(inVal);
+      if (ioSlot.compare_exchange_strong(result, made, std::memory_order_acq_rel, std::memory_order_acquire))
+         result = made;
+   }
+   return result;
+}
+
+static hx::Object *fromSmallInt64(int inVal)
+{
+   return constBox<Int64Data>(sConstDynamicInt64s[inVal+1], inVal);
+}
 
 static hx::Object *fromInt(int inVal)
 {
-   hx::Object *result = 0;
    if (inVal>=-1 && inVal<256)
-   {
-      int idx = inVal+1;
-      result = sConstDynamicInts[idx].mPtr;
-      if (!result)
-         result = sConstDynamicInts[idx].mPtr = new (hx::NewObjConst)IntData(inVal);
-   }
-   else
-      result = (hx::Object *)new IntData(inVal);
-   return result;
+      return constBox<IntData>(sConstDynamicInts[inVal+1], inVal);
+   return (hx::Object *)new IntData(inVal);
 }
 
 Dynamic::Dynamic(bool inVal) : super( inVal ? hx::DynTrue.mPtr : hx::DynFalse.mPtr ) { }
@@ -366,14 +384,15 @@ Dynamic::Dynamic(short inVal)
    mPtr = fromInt(inVal);
 }
 
-#if !defined(__GNUC__) || defined(__MINGW32__) || (defined(__WORDSIZE) && (__WORDSIZE != 64))
+#if !defined(__GNUC__) || defined(__MINGW32__) || defined(__APPLE__) || (defined(__WORDSIZE) && (__WORDSIZE != 64))
+// long is 64 bits on 64-bit macOS, where int64_t is long long
 Dynamic::Dynamic(unsigned long inVal)
 {
-   mPtr = fromInt(inVal);
+   mPtr = inVal==(unsigned int)inVal ? fromInt((unsigned int)inVal) : Dynamic((cpp::UInt64)inVal).mPtr;
 }
 Dynamic::Dynamic(long inVal)
 {
-   mPtr = fromInt(inVal);
+   mPtr = inVal==(int)inVal ? fromInt((int)inVal) : Dynamic((cpp::Int64)inVal).mPtr;
 }
 #endif
 
@@ -409,12 +428,9 @@ Dynamic::Dynamic(char32_t inVal)
 
 Dynamic::Dynamic(double inVal)
 {
-   if ( (int)inVal==inVal && inVal>=-1 && inVal<256 )
+   if ( inVal>=-1 && inVal<256 && (int)inVal==inVal && !(inVal==0 && signbit(inVal)) )
    {
-      int idx = inVal+1;
-      mPtr = sConstDynamicInts[idx].mPtr;
-      if (!mPtr)
-         mPtr = sConstDynamicInts[idx].mPtr = new (hx::NewObjConst)IntData((int)inVal);
+      mPtr = constBox<IntData>(sConstDynamicInts[(int)inVal+1], (int)inVal);
    }
    else
       mPtr = (hx::Object *)new DoubleData(inVal);
@@ -425,12 +441,7 @@ Dynamic::Dynamic(cpp::Int64 inVal)
 {
    int ival = (int)inVal;
    if ( ival==inVal && ival>=-1 && ival<256 )
-   {
-      int idx = ival+1;
-      mPtr = sConstDynamicInts[idx].mPtr;
-      if (!mPtr)
-         mPtr = sConstDynamicInts[idx].mPtr = new (hx::NewObjConst)IntData(ival);
-   }
+      mPtr = fromSmallInt64(ival);
    else
       mPtr = (hx::Object *)new Int64Data(inVal);
 }
@@ -438,13 +449,8 @@ Dynamic::Dynamic(cpp::Int64 inVal)
 
 Dynamic::Dynamic(cpp::UInt64 inVal)
 {
-   if ( (int)inVal==inVal && inVal<256 )
-   {
-      int idx = inVal+1;
-      mPtr = sConstDynamicInts[idx].mPtr;
-      if (!mPtr)
-         mPtr = sConstDynamicInts[idx].mPtr = new (hx::NewObjConst)IntData(inVal);
-   }
+   if ( inVal<256 )
+      mPtr = fromSmallInt64((int)inVal);
    else
       mPtr = (hx::Object *)new Int64Data(inVal);
 }
@@ -473,7 +479,19 @@ Dynamic Dynamic::operator+(const Dynamic &inRHS) const
    int t1 = mPtr ? mPtr->__GetType() : vtNull;
    int t2 = inRHS.mPtr ? inRHS.mPtr->__GetType() : vtNull;
 
-   if ( (t1==vtInt || t1==vtFloat)  &&  (t2==vtInt || t2==vtFloat) )
+   if (t1==vtInt && t2==vtInt)
+   {
+      // Keep the result typed vtInt with 32-bit wrap, consistent with
+      // operator- and operator* (DYNAMIC_ARITH), and avoid boxing a double
+      return Dynamic( mPtr->__ToInt() + inRHS.mPtr->__ToInt() );
+   }
+   if ( (t1==vtInt64 || t1==vtInt)  &&  (t2==vtInt64 || t2==vtInt) )
+   {
+      // Boxed Int64 is numeric - previously it fell through to string
+      // concatenation, so adding two Int64 Dynamics produced a string
+      return Dynamic( mPtr->__ToInt64() + inRHS.mPtr->__ToInt64() );
+   }
+   if ( (t1==vtInt || t1==vtFloat || t1==vtInt64)  &&  (t2==vtInt || t2==vtFloat || t2==vtInt64) )
    {
       return mPtr->__ToDouble() + inRHS.mPtr->__ToDouble();
    }
@@ -494,24 +512,52 @@ Dynamic Dynamic::operator+(const TYPE &i) const \
    return Cast<double>() + i; \
 }
 
+// Int-ish scalars take the same vtInt fast path as DYNAMIC_ARITH, and a
+// vtInt64 lhs stays in 64-bit math instead of losing precision via double
+#define DYN_OP_ADD_INT(TYPE) \
+Dynamic Dynamic::operator+(const TYPE &i) const \
+{ \
+   int t = mPtr ? mPtr->__GetType() : vtNull; \
+   if (t==vtString) \
+      return Cast<String>() + String(i); \
+   if (t==vtInt) \
+      return Dynamic( (int)(*this) + i ); \
+   if (t==vtInt64) \
+      return Dynamic( mPtr->__ToInt64() + (cpp::Int64)i ); \
+   return Cast<double>() + i; \
+}
+
+#define DYN_OP_ADD_INT64(TYPE) \
+Dynamic Dynamic::operator+(const TYPE &i) const \
+{ \
+   int t = mPtr ? mPtr->__GetType() : vtNull; \
+   if (t==vtString) \
+      return Cast<String>() + String(i); \
+   if (t==vtInt || t==vtInt64) \
+      return Dynamic( (cpp::Int64)(mPtr->__ToInt64() + (cpp::Int64)i) ); \
+   return Cast<double>() + i; \
+}
+
 DYN_OP_ADD(double)
 DYN_OP_ADD(float)
-DYN_OP_ADD(int)
-DYN_OP_ADD(unsigned int)
-DYN_OP_ADD(short)
-DYN_OP_ADD(unsigned short)
-DYN_OP_ADD(signed char)
-DYN_OP_ADD(unsigned char)
-DYN_OP_ADD(char16_t)
-DYN_OP_ADD(char32_t)
-DYN_OP_ADD(cpp::Int64)
-DYN_OP_ADD(cpp::UInt64)
+DYN_OP_ADD_INT(int)
+DYN_OP_ADD_INT(unsigned int)
+DYN_OP_ADD_INT(short)
+DYN_OP_ADD_INT(unsigned short)
+DYN_OP_ADD_INT(signed char)
+DYN_OP_ADD_INT(unsigned char)
+DYN_OP_ADD_INT(char16_t)
+DYN_OP_ADD_INT(char32_t)
+DYN_OP_ADD_INT64(cpp::Int64)
+DYN_OP_ADD_INT64(cpp::UInt64)
 
 Dynamic Dynamic::operator+(const cpp::Variant &v) const
 {
    int t = mPtr ? mPtr->__GetType() : vtNull;
    if (t==vtString || v.type == cpp::Variant::typeString)
       return Cast<String>() + v.asString();
+   if (t==vtInt && v.isInt())
+      return Dynamic( mPtr->__ToInt() + (int)v );
    return Cast<double>() + v.asDouble();
 }
 
@@ -519,10 +565,14 @@ Dynamic Dynamic::operator+(const cpp::Variant &v) const
 
 double Dynamic::operator%(const Dynamic &inRHS) const
 {
-   if (mPtr->__GetType()==vtInt && inRHS.mPtr->__GetType()==vtInt)
+   // Guard null operands like operator+ does, so a null Dynamic does not crash
+   // here (e.g. from cppia or native callers); a null coerces to 0.
+   int t1 = mPtr ? mPtr->__GetType() : vtNull;
+   int t2 = inRHS.mPtr ? inRHS.mPtr->__GetType() : vtNull;
+   if (t1==vtInt && t2==vtInt)
       return mPtr->__ToInt() % inRHS->__ToInt();
-   double lhs = mPtr->__ToDouble();
-   double rhs = inRHS->__ToDouble();
+   double lhs = mPtr ? mPtr->__ToDouble() : 0.0;
+   double rhs = inRHS.mPtr ? inRHS.mPtr->__ToDouble() : 0.0;
    int even = (int)(lhs/rhs);
    double remain = lhs - even * rhs;
    if (remain<0) remain += fabs(rhs);
@@ -587,19 +637,21 @@ static bool IsInt(hx::Object *inPtr)
       return false;
    if (TCanCast<IntData>(inPtr))
       return true;
-   DoubleData *d = dynamic_cast<DoubleData *>(inPtr);
-   if (!d)
+   // Cheap virtual type probe instead of RTTI dynamic_cast - this runs for
+   // every Std.isOfType(x, Int)
+   int t = inPtr->__GetType();
+   if (t==vtFloat)
    {
-      Int64Data *i64 = dynamic_cast<Int64Data *>(inPtr);
-      if (i64)
-      {
-         int val = i64->mValue;
-         return val==i64->mValue;
-      }
-      return false;
+      double val = inPtr->__ToDouble();
+      return val>=-2147483648.0 && val<=2147483647.0 && (int)val==val;
    }
-   double val = d->__ToDouble();
-   return ((int)val == val);
+   if (t==vtInt64)
+   {
+      cpp::Int64 val64 = inPtr->__ToInt64();
+      int val = (int)val64;
+      return val==val64;
+   }
+   return false;
 }
 
 static Dynamic createEmptyInt64()

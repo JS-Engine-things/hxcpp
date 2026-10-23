@@ -40,7 +40,7 @@ struct CppiaStream
          {
             OpName &name = names[i];
             if (!tokenMap[name.id].empty())
-               throw cppiaError("Opcode id %d is defined twice (%s and %s)", name.id, tokenMap[name.id].c_str(), name.name);
+               throw "Double identifier";
             tokenMap[ name.id ] = name.name;
          }
       }
@@ -79,7 +79,7 @@ struct CppiaStream
    void skipChar()
    {
       if (data>=max)
-         throw "Unexpected end of file, the script is truncated or corrupt";
+         throw "EOF";
       if (*data=='\n')
       {
          line++;
@@ -109,7 +109,7 @@ struct CppiaStream
       std::string tok = getAsciiToken();
       CppiaOp result = (CppiaOp)opMap[tok];
       if (result==0)
-         throw cppiaError("Unknown opcode '%.32s'. The script might've been compiled against a different version.", tok.c_str());
+         throw "Unknown token";
       return result;
    }
 
@@ -136,7 +136,7 @@ struct CppiaStream
          {
             int digit = *data - '0';
             if (digit<0 || digit>9)
-               throw cppiaError("Expected a number but found '%c' (0x%02x), the script is corrupt", *data, (unsigned char)*data);
+               throw "expected digit";
             result = result * 10 + digit;
          }
          pos++;
@@ -147,6 +147,11 @@ struct CppiaStream
 
    int getByte()
    {
+      // Guard like skipChar/readBytes - a truncated cppia file otherwise
+      // drives the loader off the end of the buffer and the garbage bytes
+      // become counts and ids
+      if (data>=max)
+         throw "EOF";
       int result = *(unsigned char *)data;
       data++;
       pos++;
@@ -174,11 +179,22 @@ struct CppiaStream
       return result;
    }
 
+   int getTypeId();
+   int getStringId();
+
+   // Every item takes at least one byte
+   int checkCount(int inCount)
+   {
+      if (inCount<0 || inCount>max-data)
+         throw "Bad count";
+      return inCount;
+   }
+
    bool getBool()
    {
       int ival = getInt();
       if (ival>1)
-         throw cppiaError("Expected a bool (0 or 1) but found %d, the script is corrupt", ival);
+         throw "invalid bool";
       return ival;
    }
    bool getStatic()
@@ -201,8 +217,8 @@ struct CppiaStream
 
    void readBytes(unsigned char *outBytes, int inLen)
    {
-      if (data+inLen>max)
-         throw cppiaError("Unexpected end of file while reading %d bytes of resource data, only %d remain", inLen, (int)(max-data));
+      if (inLen<0 || inLen>max-data)
+         throw "EOF";
       memcpy(outBytes, data, inLen);
       data+=inLen;
    }

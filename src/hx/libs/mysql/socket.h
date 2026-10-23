@@ -46,7 +46,14 @@ void psock_init();
 PSOCK psock_create();
 void psock_close( PSOCK s );
 SERR psock_connect( PSOCK s, PHOST h, int port );
+SERR psock_connect_timeout( PSOCK s, PHOST h, int port, double timeout );
 SERR psock_set_timeout( PSOCK s, double timeout );
+SERR psock_set_recv_timeout( PSOCK s, double timeout );
+SERR psock_set_send_timeout( PSOCK s, double timeout );
+SERR psock_set_keepalive( PSOCK s, int idle, int interval, int count );
+void psock_keepalive_state( PSOCK s, int *state );
+int psock_last_error();
+double psock_clock();
 SERR psock_set_blocking( PSOCK s, int block );
 SERR psock_set_fastsend( PSOCK s, int fast );
 

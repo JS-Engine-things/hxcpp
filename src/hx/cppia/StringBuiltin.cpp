@@ -178,11 +178,21 @@ struct CharAtExpr : public StringExpr
 
    String runString(CppiaCtx *ctx) HXCPP_OVERRIDE
    {
+      if (CODE)
+      {
+         hx::Object *code = runObject(ctx);
+         BCR_CHECK;
+         return code ? code->toString() : String();
+      }
       String val = strVal->runString(ctx);
       BCR_CHECK;
       int idx = a0->runInt(ctx);
       BCR_CHECK;
       return val.charAt(idx);
+   }
+   Float runFloat(CppiaCtx *ctx) HXCPP_OVERRIDE
+   {
+      return runInt(ctx);
    }
    int runInt(CppiaCtx *ctx) HXCPP_OVERRIDE
    {
@@ -401,68 +411,68 @@ CppiaExpr *createStringBuiltin(CppiaExpr *inSrc, CppiaExpr *inThisExpr, String f
 {
    if (field==HX_CSTRING("toString"))
    {
-      if (ioExpressions.size()!=0) throw cppiaExprError(inSrc, "Wrong number of arguments for String.%s, the script passes %d", field.out_str(), (int)ioExpressions.size());
+      if (ioExpressions.size()!=0) throw "Bad arg count";
       return inThisExpr;
    }
    else if (field==HX_CSTRING("toUpperCase"))
    {
-      if (ioExpressions.size()!=0) throw cppiaExprError(inSrc, "Wrong number of arguments for String.%s, the script passes %d", field.out_str(), (int)ioExpressions.size());
+      if (ioExpressions.size()!=0) throw "Bad arg count";
       return new ToCaseExpr<true>(inSrc,inThisExpr);
    }
    else if (field==HX_CSTRING("toLowerCase"))
    {
-      if (ioExpressions.size()!=0) throw cppiaExprError(inSrc, "Wrong number of arguments for String.%s, the script passes %d", field.out_str(), (int)ioExpressions.size());
+      if (ioExpressions.size()!=0) throw "Bad arg count";
       return new ToCaseExpr<false>(inSrc,inThisExpr);
    }
    else if (field==HX_CSTRING("charAt"))
    {
-      if (ioExpressions.size()!=1) throw cppiaExprError(inSrc, "Wrong number of arguments for String.%s, the script passes %d", field.out_str(), (int)ioExpressions.size());
+      if (ioExpressions.size()!=1) throw "Bad arg count";
       return new CharAtExpr<false,false>(inSrc,inThisExpr,ioExpressions[0]);
    }
    else if (field==HX_CSTRING("cca"))
    {
-      if (ioExpressions.size()!=1) throw cppiaExprError(inSrc, "Wrong number of arguments for String.%s, the script passes %d", field.out_str(), (int)ioExpressions.size());
+      if (ioExpressions.size()!=1) throw "Bad arg count";
       return new CharAtExpr<true,true>(inSrc,inThisExpr,ioExpressions[0]);
    }
    else if (field==HX_CSTRING("iterator"))
    {
-      if (ioExpressions.size()!=0) throw cppiaExprError(inSrc, "Wrong number of arguments for String.%s, the script passes %d", field.out_str(), (int)ioExpressions.size());
+      if (ioExpressions.size()!=0) throw "Bad arg count";
       return new StringIteratorExpr<false>(inSrc,inThisExpr);
    }
    else if (field==HX_CSTRING("keyValueIterator"))
    {
-      if (ioExpressions.size()!=0) throw cppiaExprError(inSrc, "Wrong number of arguments for String.%s, the script passes %d", field.out_str(), (int)ioExpressions.size());
+      if (ioExpressions.size()!=0) throw "Bad arg count";
       return new StringIteratorExpr<true>(inSrc,inThisExpr);
    }
    else if (field==HX_CSTRING("charCodeAt"))
    {
-      if (ioExpressions.size()!=1) throw cppiaExprError(inSrc, "Wrong number of arguments for String.%s, the script passes %d", field.out_str(), (int)ioExpressions.size());
+      if (ioExpressions.size()!=1) throw "Bad arg count";
       return new CharAtExpr<true,false>(inSrc,inThisExpr,ioExpressions[0]);
    }
    else if (field==HX_CSTRING("split"))
    {
-      if (ioExpressions.size()!=1) throw cppiaExprError(inSrc, "Wrong number of arguments for String.%s, the script passes %d", field.out_str(), (int)ioExpressions.size());
+      if (ioExpressions.size()!=1) throw "Bad arg count";
       return new SplitExpr(inSrc,inThisExpr,ioExpressions[0]);
    }
    else if (field==HX_CSTRING("indexOf"))
    {
-      if (ioExpressions.size()!=2) throw cppiaExprError(inSrc, "Wrong number of arguments for String.%s, the script passes %d", field.out_str(), (int)ioExpressions.size());
+      if (ioExpressions.size()!=2) throw "Bad arg count";
       return new IndexOfExpr<false>(inSrc,inThisExpr,ioExpressions[0], ioExpressions[1]);
    }
    else if (field==HX_CSTRING("lastIndexOf"))
    {
-      if (ioExpressions.size()!=2) throw cppiaExprError(inSrc, "Wrong number of arguments for String.%s, the script passes %d", field.out_str(), (int)ioExpressions.size());
+      if (ioExpressions.size()!=2) throw "Bad arg count";
       return new IndexOfExpr<true>(inSrc,inThisExpr,ioExpressions[0], ioExpressions[1]);
    }
 
    else if (field==HX_CSTRING("substr"))
    {
-      if (ioExpressions.size()!=2) throw cppiaExprError(inSrc, "Wrong number of arguments for String.%s, the script passes %d", field.out_str(), (int)ioExpressions.size());
+      if (ioExpressions.size()!=2) throw "Bad arg count";
       return new SubStrExpr<true>(inSrc,inThisExpr, ioExpressions[0], ioExpressions[1]);
    }
    else if (field==HX_CSTRING("substring"))
    {
-      if (ioExpressions.size()!=2) throw cppiaExprError(inSrc, "Wrong number of arguments for String.%s, the script passes %d", field.out_str(), (int)ioExpressions.size());
+      if (ioExpressions.size()!=2) throw "Bad arg count";
       return new SubStrExpr<false>(inSrc,inThisExpr, ioExpressions[0], ioExpressions[1]);
    }
 

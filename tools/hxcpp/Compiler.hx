@@ -474,6 +474,8 @@ class Compiler
                      FileSystem.deleteFile(obj_name);
                   BuildTool.setThreadError(err);
                }
+               else
+                  inProgress.fileDone();
             }
          }
          else
@@ -487,6 +489,7 @@ class Compiler
                Tools.exit (result);
                //throw "Error : " + result + " - build cancelled";
             }
+            inProgress.fileDone();
          }
 
          if (!Log.verbose && (inTid >= 0 && BuildTool.threadExitCode == 0))
@@ -611,6 +614,7 @@ class Compiler
       addOptimTags(tags);
       for(flag in mFlags)
          flag.add(args,tags);
+      addStandard(Cxx, inGroup, args);
 
       return  args.concat( mCPPFlags );
    }
@@ -655,16 +659,16 @@ class Compiler
 
       args = args.concat( mPCHFlags );
 
-		addStandard(Cxx, inGroup, args);
-
       //Log.info("", "Make pch dir " + dir );
       PathManager.mkdir(dir);
 
       if (mPCH == "msvc")
       {
          args.push( mPCHCreate + header + ".h" );
-         var symbol = "link" + Md5.encode( PathManager.combine(dir, file + mExt) );
-         args.push( "-Yl" + symbol  );
+         if (!BuildTool.isMsvcLlvm()) {
+            var symbol = "link" + Md5.encode( PathManager.combine(dir, file + mExt) );
+            args.push( "-Yl" + symbol  );
+         }
 
          // Create a temp file for including ...
          var tmp_cpp = dir + "/" + file + ".cpp";
@@ -729,7 +733,7 @@ class Compiler
    {
       mPCH = inPCH;
       createCompilerVersion();
-		if (inPCH != null && ~/clang/i.match(mCompilerVersionString)) {
+      if (inPCH != null && ~/clang/i.match(mCompilerVersionString) && !BuildTool.isMsvcLlvm()) {
          mPCH = "clang";
       }
       switch (mPCH) {

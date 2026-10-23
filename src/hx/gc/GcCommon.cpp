@@ -3,6 +3,8 @@
 #include <map>
 #include <vector>
 #include <set>
+#include <cstdio>
+#include <cstring>
 #include <stdlib.h>
 
 #if defined(HXCPP_CAPTURE_x64) && !defined(__GNUC__)
@@ -27,47 +29,59 @@ extern void __hxt_new_string(void* result, int size);
 namespace hx
 {
 #if defined(HX_MACOS) || defined(HX_WINDOWS) || defined(HX_LINUX) || defined(__ORBIS__)
-int sgMinimumWorkingMemory       = 20*1024*1024;
-int sgMinimumFreeSpace           = 10*1024*1024;
+size_t sgMinimumWorkingMemory       = 20*1024*1024;
+size_t sgMinimumFreeSpace           = 10*1024*1024;
 #else
-int sgMinimumWorkingMemory       = 8*1024*1024;
-int sgMinimumFreeSpace           = 4*1024*1024;
+size_t sgMinimumWorkingMemory       = 8*1024*1024;
+size_t sgMinimumFreeSpace           = 4*1024*1024;
 #endif
 // Once you use more than the minimum, this kicks in...
-int sgTargetFreeSpacePercentage  = 100;
+size_t sgTargetFreeSpacePercentage  = 100;
 
 
 
 
 
+
+// %zu would take "-1" as SIZE_MAX
+static bool parseSize(const char *inText, size_t &outValue)
+{
+   return !strchr(inText, '-') && 1 == std::sscanf(inText, "%zu", &outValue);
+}
 
 // Called internally before and GC operations
 void CommonInitAlloc()
 {
+    // It is probably safe to use something like strtoull for parsing the size_t values as I'm sure every reasonable implementation treats them as uint64_t.
+    // But just to be pedantic let's use sscanf which is the only "official" way to do this in C++11.
+    // C++17 gives us std::charconv but I haven't twisted enough arms yet to have 17 be the minimum version.
+
    #if !defined(HX_WINRT) && !defined(__SNC__) && !defined(__ORBIS__)
-   const char *minimumWorking = getenv("HXCPP_MINIMUM_WORKING_MEMORY");
-   if (minimumWorking)
+   const char *minimumWorking{ getenv("HXCPP_MINIMUM_WORKING_MEMORY") };
+   if (minimumWorking && *minimumWorking)
    {
-      int mem =  atoi(minimumWorking);
-      if (mem>0)
-         sgMinimumWorkingMemory = mem;
+       if (!parseSize(minimumWorking, sgMinimumWorkingMemory))
+       {
+           hx::CriticalError(HX_CSTRING("Failed to parse number from HXCPP_MINIMUM_WORKING_MEMORY environment variable"));
+       }
    }
 
-   const char *minimumFreeSpace = getenv("HXCPP_MINIMUM_FREE_SPACE");
-   if (minimumFreeSpace)
+   const char* minimumFreeSpace{ getenv("HXCPP_MINIMUM_FREE_SPACE") };
+   if (minimumFreeSpace && *minimumFreeSpace)
    {
-      int mem =  atoi(minimumFreeSpace);
-      if (mem>0)
-         sgMinimumFreeSpace = mem;
+       if (!parseSize(minimumFreeSpace, sgMinimumFreeSpace))
+       {
+           hx::CriticalError(HX_CSTRING("Failed to parse number from HXCPP_MINIMUM_FREE_SPACE environment variable"));
+       }
    }
 
-
-   const char *targetFree = getenv("HXCPP_TARGET_FREE_SPACE");
-   if (targetFree)
+   const char* targetFree{ getenv("HXCPP_TARGET_FREE_SPACE") };
+   if (targetFree && *targetFree)
    {
-      int percent =  atoi(targetFree);
-      if (percent>0)
-         sgTargetFreeSpacePercentage = percent;
+       if (!parseSize(targetFree, sgTargetFreeSpacePercentage))
+       {
+           hx::CriticalError(HX_CSTRING("Failed to parse number from HXCPP_TARGET_FREE_SPACE environment variable"));
+       }
    }
    #endif
 }
@@ -88,13 +102,15 @@ void __hxcpp_collect(bool inMajor)
 }
 
 
+namespace hx { size_t InternalCompactBytes(); }
+
 void __hxcpp_gc_compact()
 {
-   int mem = hx::InternalCollect(true,true);
+   size_t mem = hx::InternalCompactBytes();
    while(true)
    {
-      int compact = hx::InternalCollect(true,true);
-      if (compact>=mem-16384)
+      size_t compact = hx::InternalCompactBytes();
+      if (compact+16384>=mem)
          break;
       mem = compact;
    }
@@ -113,8 +129,14 @@ void GCAddFinalizer(hx::Object *v, finalizer f)
 
 HX_CHAR *NewString(int inLen)
 {
-   char *result =  (char *)hx::InternalNew( (inLen+1)*sizeof(char), false );
+   // Strings long enough for rehashing to be noticeable get four extra
+   // bytes after the terminator, where String::hash() memoizes the hash on
+   // first use
+   bool hashSlot = inLen >= HX_GC_STRING_HASH_SLOT_MIN_LEN;
+   char *result =  (char *)hx::InternalNew( (inLen+1)*sizeof(char) + (hashSlot ? 4 : 0), false );
    result[inLen] = '\0';
+   if (hashSlot)
+      ((unsigned int *)result)[-1] |= HX_GC_STRING_HASH_SLOT;
 #ifdef HXCPP_TELEMETRY
    __hxt_new_string(result, inLen+1);
 #endif
@@ -122,7 +144,7 @@ HX_CHAR *NewString(int inLen)
 
 }
 
-void *NewGCBytes(void *inData,int inSize)
+void *NewGCBytes(void *inData, size_t inSize)
 {
    void *result =  hx::InternalNew(inSize,false);
    if (inData)
@@ -133,7 +155,7 @@ void *NewGCBytes(void *inData,int inSize)
 }
 
 
-void *NewGCPrivate(void *inData,int inSize)
+void *NewGCPrivate(void *inData, size_t inSize)
 {
    void *result =  InternalNew(inSize,false);
    if (inData)
@@ -157,17 +179,17 @@ void __hxcpp_enable(bool inEnable)
 
 void  __hxcpp_set_minimum_working_memory(int inBytes)
 {
-   hx::sgMinimumWorkingMemory = inBytes;
+   hx::sgMinimumWorkingMemory = inBytes<0 ? 0 : inBytes;
 }
 
 void  __hxcpp_set_minimum_free_space(int inBytes)
 {
-   hx::sgMinimumFreeSpace = inBytes;
+   hx::sgMinimumFreeSpace = inBytes<0 ? 0 : inBytes;
 }
 
 void  __hxcpp_set_target_free_space_percentage(int inPercentage)
 {
-   hx::sgTargetFreeSpacePercentage = inPercentage;
+   hx::sgTargetFreeSpacePercentage = inPercentage<0 ? 0 : inPercentage;
 }
 
 bool __hxcpp_is_const_string(const ::String &inString)

@@ -1,14 +1,20 @@
 #include <hxcpp.h>
 #include <hx/OS.h>
+#include <hx/Thread.h>
 
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <string>
+#include <vector>
 #include <time.h>
 
 #ifndef EPPC
 #include <sys/types.h>
 #include <sys/stat.h>
+#ifdef __linux__
+#include <fcntl.h>
+#endif
 #endif
 
 
@@ -30,7 +36,7 @@
    #include <limits.h>
    #ifndef ANDROID
       #include <locale.h>
-      #if !defined(EPPC) && !defined(__GLIBC__)
+      #if !defined(EPPC) && !defined(__GLIBC__) && !defined(__linux__) && !defined(NEKO_BSD)
          #include <xlocale.h>
       #endif
    #endif
@@ -52,7 +58,7 @@
    #include <string>
 #endif
 
-#ifdef HX_ANDROID
+#if defined(HX_ANDROID) || defined(NEKO_BSD)
  #include <sys/wait.h>
 #endif
 
@@ -75,18 +81,54 @@
    <doc>Get some environment variable if exists</doc>
 **/
 
+// The environment is shared mutable state: putenv/setenv may free or move
+// the storage a concurrent getenv result points into.  Serialize access and
+// copy under the lock.
+static HxMutex &hxEnvMutex()
+{
+   static HxMutex sMutex;
+   return sMutex;
+}
+
 String _hx_std_get_env( String v )
 {
    #ifdef HX_WINRT
       return String();
    #else
+      // Copy the value out under the lock, and make the GC string after
+      // releasing it: an allocation can start a collection, which would
+      // wait forever for a thread blocked on this lock
+      bool found = false;
       #if defined(NEKO_WINDOWS) && defined(HX_SMART_STRINGS)
          hx::strbuf wbuf;
-         return String::create( _wgetenv( v.wchar_str(&wbuf) ) );
+         const wchar_t *name = v.wchar_str(&wbuf);
+         std::wstring value;
+         {
+            AutoLock lock(hxEnvMutex());
+            const wchar_t *found_value = _wgetenv(name);
+            if (found_value)
+            {
+               found = true;
+               value = found_value;
+            }
+         }
       #else
          hx::strbuf buf;
-         return String::create( getenv(v.utf8_str(&buf)) );
+         const char *name = v.utf8_str(&buf);
+         std::string value;
+         {
+            AutoLock lock(hxEnvMutex());
+            const char *found_value = getenv(name);
+            if (found_value)
+            {
+               found = true;
+               value = found_value;
+            }
+         }
       #endif
+      if (!found)
+         return String();
+      return String::create(value.c_str(), (int)value.size());
    #endif
 }
 
@@ -101,17 +143,30 @@ void _hx_std_put_env( String e, String v )
 #elif defined(NEKO_WINDOWS)
    String set = e + HX_CSTRING("=") + (v != null() ? v : String(HX_CSTRING("")));
 
+   // Convert before taking the lock - conversion can allocate, and an
+   // allocation must not happen under it (see _hx_std_get_env)
    #ifdef HX_SMART_STRINGS
    if (set.isUTF16Encoded())
-      _wputenv(set.wchar_str());
+   {
+      const wchar_t *w = set.wchar_str();
+      AutoLock lock(hxEnvMutex());
+      _wputenv(w);
+   }
    else
    #endif
-      putenv(set.utf8_str());
+   {
+      const char *u = set.utf8_str();
+      AutoLock lock(hxEnvMutex());
+      putenv(u);
+   }
 #else
-   if (v == null())
-      unsetenv(e.utf8_str());
+   const char *name = e.utf8_str();
+   const char *value = v == null() ? 0 : v.utf8_str();
+   AutoLock lock(hxEnvMutex());
+   if (!value)
+      unsetenv(name);
    else
-      setenv(e.utf8_str(),v.utf8_str(),1);
+      setenv(name,value,1);
 #endif
 }
 
@@ -122,6 +177,13 @@ void _hx_std_put_env( String e, String v )
 
 void _hx_std_sys_sleep( double f )
 {
+   // A negative duration sleeps for zero - the double->DWORD conversion on
+   // Windows wraps it to ~49.7 days, and schedulers routinely compute
+   // sleep(deadline - now), which dips below zero under load.  (!(f>0) also
+   // catches NaN.)  Zero still sleeps: Sys.sleep(0) gives up the time slice,
+   // and spin-wait loops rely on that to let other threads run.
+   if (!(f > 0))
+      f = 0;
    hx::EnterGCFreeZone();
 #if defined(NEKO_WINDOWS)
    Sleep((DWORD)(f * 1000));
@@ -194,27 +256,30 @@ String _hx_std_get_cwd()
    return String();
    #else
 #ifdef NEKO_WINDOWS
-   wchar_t buf[261];
-   int l;
-   if( !GetCurrentDirectoryW(260,buf) )
-      return String();
-   l = (int)wcslen(buf);
-   if( buf[l-1] != '/' && buf[l-1] != '\\' ) {
-      buf[l] = '/';
-      buf[l+1] = 0;
-   }
+   std::vector<wchar_t> buf;
+   DWORD l = 0;
+   do
+   {
+      buf.resize(l + 2);
+      l = GetCurrentDirectoryW((DWORD)buf.size() - 1, buf.data());
+      if( !l )
+         return String();
+   } while( l >= buf.size() - 1 );
 #else
-   char buf[1025];
-   int l;
-   if( getcwd(buf,1024) == NULL )
-      return String();
-   l = (int)strlen(buf);
+   std::vector<char> buf(1024);
+   while( getcwd(buf.data(), buf.size() - 1) == NULL )
+   {
+      if( errno != ERANGE )
+         return String();
+      buf.resize(buf.size() * 2);
+   }
+   size_t l = strlen(buf.data());
+#endif
    if( buf[l-1] != '/' && buf[l-1] != '\\' ) {
       buf[l] = '/';
       buf[l+1] = 0;
    }
-#endif
-   return String::create(buf);
+   return String::create(buf.data());
    #endif
 }
 
@@ -226,10 +291,14 @@ bool _hx_std_set_cwd( String d )
 {
    #if !defined(HX_WINRT) && !defined(EPPC)
 #ifdef NEKO_WINDOWS
-   return SetCurrentDirectoryW(d.wchar_str()) == 0;
+   // _wchdir also updates the drive's =X: variable, as the CRT and the other targets do
+   bool ok = _wchdir(d.wchar_str()) == 0;
 #else
-   return chdir(d.utf8_str()) == 0;
+   bool ok = chdir(d.utf8_str()) == 0;
 #endif
+   if (!ok)
+      hx::Throw(HX_CSTRING("Could not set the current directory to ") + d);
+   return true;
    #else
    return false;
    #endif
@@ -415,6 +484,11 @@ void  _hx_std_sys_rename( String path, String newname )
 
 #define STATF(f) o->Add(HX_CSTRING(#f),(int)(s.st_##f))
 
+// statx reports when a file was created, where <sys/stat.h> declares it
+#if defined(__linux__) && defined(STATX_BTIME) && (!defined(__ANDROID__) || __ANDROID_API__ >= 30)
+   #define HX_STATX
+#endif
+
 /**
    sys_stat : string -> {
       gid => int,
@@ -438,6 +512,8 @@ Dynamic _hx_std_sys_stat( String path )
    #else
    hx::EnterGCFreeZone();
    bool err = false;
+   // ctime is the creation time, as on Windows, where the file system records one
+   int ctime = 0;
    #if defined(NEKO_WINDOWS)
       struct _stat s;
       #if defined(HX_SMART_STRINGS)
@@ -452,22 +528,33 @@ Dynamic _hx_std_sys_stat( String path )
          hx::strbuf buf;
          err = _stat(path.utf8_str(&buf),&s);
       }
+      ctime = (int)s.st_ctime;
    #else
       struct stat s;
       hx::strbuf buf;
-      err = stat(path.utf8_str(&buf),&s);
+      const char *utf8 = path.utf8_str(&buf);
+      err = stat(utf8,&s);
+      ctime = (int)s.st_ctime;
+      #if defined(HX_STATX)
+      struct statx sx;
+      if (!err && statx(AT_FDCWD,utf8,0,STATX_BTIME,&sx)==0 && (sx.stx_mask & STATX_BTIME))
+         ctime = (int)sx.stx_btime.tv_sec;
+      #elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__)
+      if (s.st_birthtime>0)
+         ctime = (int)s.st_birthtime;
+      #endif
    #endif
 
    hx::ExitGCFreeZone();
    if (err)
-      return null();
+      hx::Throw(HX_CSTRING("Could not stat ") + path);
    hx::Anon o = hx::Anon_obj::Create();
 
    STATF(gid);
    STATF(uid);
    STATF(atime);
    STATF(mtime);
-   STATF(ctime);
+   o->Add(HX_CSTRING("ctime"),ctime);
    STATF(dev);
    STATF(ino);
    STATF(mode);
@@ -527,22 +614,21 @@ String _hx_std_sys_file_type( String path )
    if (err)
       return String();
 
-   if( s.st_mode & S_IFREG )
-      return HX_CSTRING("file");
-   if( s.st_mode & S_IFDIR )
-      return HX_CSTRING("dir");
-   if( s.st_mode & S_IFCHR )
-      return HX_CSTRING("char");
+   // The S_IF* constants are values of the S_IFMT field, not independent
+   // bits - testing them with & made sockets report as "file" and block
+   // devices as "dir" (FileSystem.isDirectory matched block devices)
+   switch( s.st_mode & S_IFMT )
+   {
+      case S_IFREG: return HX_CSTRING("file");
+      case S_IFDIR: return HX_CSTRING("dir");
+      case S_IFCHR: return HX_CSTRING("char");
 #ifndef NEKO_WINDOWS
-   if( s.st_mode & S_IFLNK )
-      return HX_CSTRING("symlink");
-   if( s.st_mode & S_IFBLK )
-      return HX_CSTRING("block");
-   if( s.st_mode & S_IFIFO )
-      return HX_CSTRING("fifo");
-   if( s.st_mode & S_IFSOCK )
-      return HX_CSTRING("sock");
+      case S_IFLNK: return HX_CSTRING("symlink");
+      case S_IFBLK: return HX_CSTRING("block");
+      case S_IFIFO: return HX_CSTRING("fifo");
+      case S_IFSOCK: return HX_CSTRING("sock");
 #endif
+   }
    return String();
    #endif
 }
@@ -610,14 +696,19 @@ double _hx_std_sys_time()
 {
 #ifdef NEKO_WINDOWS
 #define EPOCH_DIFF   (134774*24*60*60.0)
-   SYSTEMTIME t;
+   // GetSystemTime only updates at the ~15.6ms timer tick; the precise
+   // variant (Win8+) has sub-microsecond resolution at the same epoch
+   typedef VOID (WINAPI *GetTimeFunc)(LPFILETIME);
+   static GetTimeFunc sGetTime = (GetTimeFunc)GetProcAddress(
+         GetModuleHandleA("kernel32"), "GetSystemTimePreciseAsFileTime");
    FILETIME ft;
-    ULARGE_INTEGER ui;
-   GetSystemTime(&t);
-   if( !SystemTimeToFileTime(&t,&ft) )
-      return 0;
-    ui.LowPart = ft.dwLowDateTime;
-    ui.HighPart = ft.dwHighDateTime;
+   ULARGE_INTEGER ui;
+   if( sGetTime )
+      sGetTime(&ft);
+   else
+      GetSystemTimeAsFileTime(&ft);
+   ui.LowPart = ft.dwLowDateTime;
+   ui.HighPart = ft.dwHighDateTime;
    return ( ((double)ui.QuadPart) / 10000000.0 - EPOCH_DIFF );
 #elif defined(EPPC)
    time_t tod;
@@ -675,7 +766,8 @@ Array<String> _hx_std_sys_read_dir( String p )
    std::wstring tempWStr(path);
    std::string searchPath(tempWStr.begin(), tempWStr.end());
   #else
-   wchar_t searchPath[ MAX_PATH + 4 ];
+   // Worst case append below is "/*.*" plus the terminator - five wchars
+   wchar_t searchPath[ MAX_PATH + 5 ];
    memcpy(searchPath,path, len*sizeof(wchar_t));
   #endif
 
@@ -750,7 +842,10 @@ String _hx_std_file_full_path( String path )
 #elif defined(NEKO_WINDOWS)
    wchar_t buf[MAX_PATH+1];
    hx::strbuf wbuf;
-   if( GetFullPathNameW(path.wchar_str(&wbuf),MAX_PATH+1,buf,NULL) == 0 )
+   // A return larger than the buffer is the REQUIRED size - the buffer was
+   // not written, so treating it as success returned uninitialized stack
+   DWORD res = GetFullPathNameW(path.wchar_str(&wbuf),MAX_PATH+1,buf,NULL);
+   if( res == 0 || res > MAX_PATH+1 )
       return null();
    return String::create(buf);
 #elif defined(EPPC)
@@ -790,7 +885,7 @@ String _hx_std_sys_exe_path()
 #else
    {
       char path[PATH_MAX];
-      int length = readlink("/proc/self/exe", path, sizeof(path));
+      int length = readlink("/proc/self/exe", path, sizeof(path) - 1);
       if( length < 0 )
       {
          const char *p = getenv("_");
@@ -822,19 +917,48 @@ extern char **environ;
 Array<String> _hx_std_sys_env()
 {
    Array<String> result = Array_obj<String>::__new();
-   #ifndef HX_WINRT
-   char **e = environ;
-   while( *e )
+   #if defined(NEKO_WINDOWS) && defined(HX_SMART_STRINGS) && !defined(HX_WINRT)
+   // The narrow environ is in the ANSI code page, so read the wide block
+   std::vector<std::wstring> entries;
    {
-      char *x = strchr(*e,'=');
-      if( x == NULL )
+      AutoLock lock(hxEnvMutex());
+      wchar_t *block = GetEnvironmentStringsW();
+      if (block)
       {
-         e++;
-         continue;
+         for(const wchar_t *e = block; *e; e += wcslen(e)+1)
+            entries.push_back(e);
+         FreeEnvironmentStringsW(block);
       }
-      result->push(String::create(*e,(int)(x-*e)));
+   }
+   for(size_t i=0;i<entries.size();i++)
+   {
+      const std::wstring &entry = entries[i];
+      // Entries like "=C:=C:\dir" are the per-drive directories, not variables
+      if (entry.empty() || entry[0]==L'=')
+         continue;
+      size_t x = entry.find(L'=');
+      if (x == std::wstring::npos)
+         continue;
+      result->push(String::create(entry.c_str(),(int)x));
+      result->push(String::create(entry.c_str()+x+1,(int)(entry.size()-x-1)));
+   }
+   #elif !defined(HX_WINRT)
+   // Copy the entries under the lock, build the GC strings after releasing
+   // it (see _hx_std_get_env)
+   std::vector<std::string> entries;
+   {
+      AutoLock lock(hxEnvMutex());
+      for(char **e = environ; *e; e++)
+         entries.push_back(*e);
+   }
+   for(size_t i=0;i<entries.size();i++)
+   {
+      const char *entry = entries[i].c_str();
+      const char *x = strchr(entry,'=');
+      if( x == NULL )
+         continue;
+      result->push(String::create(entry,(int)(x-entry)));
       result->push(String::create(x+1));
-      e++;
    }
    #endif
    return result;

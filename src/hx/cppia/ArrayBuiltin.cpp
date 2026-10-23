@@ -88,6 +88,11 @@ CppiaExpr *ArrayBuiltinBase::link(CppiaModule &inData)
 
 
 #ifdef CPPIA_JIT
+// The memory type of a 4-byte element. The JIT holds floats as doubles, so a
+// Float32 element is converted on the way in and out.
+template<typename ELEM>
+inline JitType elem4JitType() { return ExprTypeOf<ELEM>::value==etFloat ? jtFloat32 : jtAny; }
+
 static ArrayBase * SLJIT_CALL array_expand_size(ArrayBase *inArray, int inSize)
 {
    inArray->Realloc(inSize+1);
@@ -111,10 +116,12 @@ struct ArraySetter : public ArrayBuiltinBase
    {
       return (ExprType)ExprTypeOf<ELEM>::value;
    }
+   bool isBoolInt() HXCPP_OVERRIDE { return ExprTypeIsBool<ELEM>::value; }
    int runInt(CppiaCtx *ctx) HXCPP_OVERRIDE
    {
       Array_obj<ELEM> *thisVal = reinterpret_cast<Array_obj<ELEM>*>(thisExpr->runObject(ctx));
       BCR_CHECK;
+      CPPIA_CHECK(thisVal);
       int i = args[0]->runInt(ctx);
       BCR_CHECK;
       ELEM &elem = thisVal->Item(i);
@@ -129,6 +136,7 @@ struct ArraySetter : public ArrayBuiltinBase
    {
       Array_obj<ELEM> *thisVal = reinterpret_cast<Array_obj<ELEM>*>(thisExpr->runObject(ctx));
       BCR_CHECK;
+      CPPIA_CHECK(thisVal);
       int i = args[0]->runInt(ctx);
       BCR_CHECK;
       ELEM &elem = thisVal->Item(i);
@@ -143,6 +151,7 @@ struct ArraySetter : public ArrayBuiltinBase
    {
       Array_obj<ELEM> *thisVal = reinterpret_cast<Array_obj<ELEM>*>(thisExpr->runObject(ctx));
       BCR_CHECK;
+      CPPIA_CHECK(thisVal);
       int i = args[0]->runInt(ctx);
       BCR_CHECK;
       ELEM &elem = thisVal->Item(i);
@@ -157,6 +166,7 @@ struct ArraySetter : public ArrayBuiltinBase
    {
       Array_obj<ELEM> *thisVal = reinterpret_cast<Array_obj<ELEM>*>(thisExpr->runObject(ctx));
       BCR_CHECK;
+      CPPIA_CHECK(thisVal);
       int i = args[0]->runInt(ctx);
       BCR_CHECK;
       ELEM &elem = thisVal->Item(i);
@@ -249,6 +259,7 @@ struct ArraySetter : public ArrayBuiltinBase
       {
          JitTemp thisVal(compiler,jtPointer);
          thisExpr->genCode(compiler, thisVal, etObject);
+         genNullReferenceExceptionCheck(compiler, thisVal);
 
          // sJitTemp1 = index
          JitTemp index(compiler,jtInt);
@@ -263,6 +274,12 @@ struct ArraySetter : public ArrayBuiltinBase
          // sJitTemp0 = this
          compiler->move(sJitTemp0, thisVal);
 
+         // A negative index must not store - the unsigned length/alloc
+         // compares below treat it as huge, the expand call is a no-op and
+         // the store then lands before the buffer.  Compiled code drops the
+         // write (Item() returns a dummy); match that, the expression
+         // result is still the right-hand side.
+         JumpId negativeIndex = compiler->compare( cmpI_SIG_LESS, sJitTemp1.as(jtInt), (int)0 );
 
          // Check length..
          JumpId lengthOk = compiler->compare( cmpI_LESS, sJitTemp1.as(jtInt),
@@ -316,7 +333,7 @@ struct ArraySetter : public ArrayBuiltinBase
          }
          else if (sizeof(ELEM)==4)
          {
-            compiler->move( sJitTemp0.atReg(sJitTemp1,2), value );
+            compiler->move( sJitTemp0.atReg(sJitTemp1,2,elem4JitType<ELEM>()), value );
             #ifdef HXCPP_GC_GENERATIONAL
             if (hx::ContainsPointers<ELEM>())
                genWriteBarrier(compiler, sJitTemp2, value );
@@ -335,6 +352,7 @@ struct ArraySetter : public ArrayBuiltinBase
             printf("Unknown element size\n");
          }
 
+         compiler->comeFrom(negativeIndex);
 
          if (destType!=etVoid && destType!=etNull)
          {
@@ -346,6 +364,7 @@ struct ArraySetter : public ArrayBuiltinBase
          // this, inDestElement, index, value(right hand side)
          JitMultiArgs margs(compiler, 3);
          thisExpr->genCode(compiler, margs.arg(0,jtPointer), etObject);
+         genNullReferenceExceptionCheck(compiler, margs.arg(0,jtPointer));
          args[0]->genCode(compiler, margs.arg(1,jtInt), etInt);
          args[1]->genCode(compiler, margs.arg(2,getJitType(rightHandType)), rightHandType);
 
@@ -375,7 +394,13 @@ struct ArraySetter : public ArrayBuiltinBase
                 ptrType = jtByte;
             else if (sizeof(ELEM)==2)
                 ptrType = jtShort;
-            compiler->convert( sJitReturnReg.star(ptrType), elemType, inDest, destType );
+            if (sizeof(ELEM)==4 && elemType==etFloat)
+            {
+               compiler->move( sJitTempF0, sJitReturnReg.star(jtFloat32) );
+               compiler->convert( sJitTempF0, elemType, inDest, destType );
+            }
+            else
+               compiler->convert( sJitReturnReg.star(ptrType), elemType, inDest, destType );
          }
       }
    }
@@ -412,6 +437,13 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       unsafe = inUnsafe;
    }
    const char *getName() HXCPP_OVERRIDE { return gArrayFuncNames[FUNC]; }
+
+   // Bools travel as Int, so what boxes the result must be told it is one
+   bool isBoolInt() HXCPP_OVERRIDE
+   {
+      return FUNC==afContains || FUNC==afRemove ||
+             ((FUNC==af__get || FUNC==af__set) && ExprTypeIsBool<ELEM>::value);
+   }
 
    ExprType getType() HXCPP_OVERRIDE
    {
@@ -460,6 +492,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          ELEM elem;
          runValue(elem,ctx,args[0]);
          BCR_CHECK;
@@ -470,18 +503,21 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          return ValToInt(thisVal->pop());
       }
       if (FUNC==afShift)
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          return ValToInt(thisVal->shift());
       }
       if (FUNC==afContains)
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          ELEM elem;
          runValue(elem,ctx,args[0]);
          BCR_CHECK;
@@ -491,6 +527,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          ELEM elem;
          runValue(elem,ctx,args[0]);
          BCR_CHECK;
@@ -500,6 +537,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          ELEM elem;
          runValue(elem,ctx,args[0]);
          BCR_CHECK;
@@ -511,6 +549,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          ELEM elem;
          runValue(elem,ctx,args[0]);
          BCR_CHECK;
@@ -522,6 +561,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          int idx = args[0]->runInt(ctx);
          BCR_CHECK;
          return ValToInt(thisVal->__get(idx));
@@ -530,6 +570,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          int i = args[0]->runInt(ctx);
          BCR_CHECK;
          ELEM elem;
@@ -546,6 +587,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          int idx = args[0]->runInt(ctx);
          BCR_CHECK;
          ELEM &elem = thisVal->Item(idx);
@@ -566,24 +608,28 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          return ValToFloat(thisVal->pop());
       }
       if (FUNC==afShift)
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          return ValToFloat(thisVal->shift());
       }
       if (FUNC==af__get)
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          return ValToFloat(thisVal->__get(args[0]->runInt(ctx)));
       }
       if (FUNC==af__set)
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          int i = args[0]->runInt(ctx);
          ELEM elem;
          runValue(elem,ctx,args[1]);
@@ -598,6 +644,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       if (FUNC==af__crement)
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
+         CPPIA_CHECK(thisVal);
          ELEM &elem = thisVal->Item(args[0]->runInt(ctx));
 
          Float result = ValToFloat(CREMENT::run(elem));
@@ -620,18 +667,21 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          return ValToString(thisVal->pop());
       }
       if (FUNC==afShift)
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          return ValToString(thisVal->shift());
       }
       if (FUNC==af__get)
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          int idx = args[0]->runInt(ctx);
          BCR_CHECK;
          return ValToString(thisVal->__get(idx));
@@ -640,6 +690,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          int i = args[0]->runInt(ctx);
          BCR_CHECK;
          ELEM elem;
@@ -655,6 +706,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          int idx = args[0]->runInt(ctx);
          BCR_CHECK;
          ELEM &elem = thisVal->Item(idx);
@@ -671,6 +723,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          String space = args[0]->runString(ctx);
          BCR_CHECK;
          return thisVal->join(space);
@@ -680,10 +733,13 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          return thisVal->toString();
       }
 
-      if (FUNC==afPush || FUNC==afContains || FUNC==afRemove || FUNC==afIndexOf || FUNC==afLastIndexOf)
+      if (FUNC==afContains || FUNC==afRemove)
+         return Dynamic(runInt(ctx)!=0)->toString();
+      if (FUNC==afPush || FUNC==afIndexOf || FUNC==afLastIndexOf)
          return Dynamic(runInt(ctx))->toString();
 
       return runObject(ctx)->toString();
@@ -694,6 +750,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          int idx = args[0]->runInt(ctx);
          BCR_CHECK;
          return thisVal->__GetItem(idx).mPtr;
@@ -702,6 +759,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          int i = args[0]->runInt(ctx);
          BCR_CHECK;
          ELEM elem;
@@ -716,6 +774,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          int idx = args[0]->runInt(ctx);
          BCR_CHECK;
          ELEM &elem = thisVal->Item(idx);
@@ -732,12 +791,14 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          return Dynamic(thisVal->pop()).mPtr;
       }
       if (FUNC==afShift)
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          return Dynamic(thisVal->shift()).mPtr;
       }
 
@@ -746,6 +807,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          Array_obj<ELEM> *inVal = (Array_obj<ELEM>*)args[0]->runObject(ctx);
          BCR_CHECK;
          return thisVal->concat(inVal).mPtr;
@@ -754,12 +816,14 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          return thisVal->copy().mPtr;
       }
       if (FUNC==afSplice)
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          int pos = args[0]->runInt(ctx);
          BCR_CHECK;
          int end = args[1]->runInt(ctx);
@@ -770,6 +834,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          int pos = args[0]->runInt(ctx);
          BCR_CHECK;
          hx::Object *end = args[1]->runObject(ctx);
@@ -781,6 +846,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
          // TODO - maybe make this more efficient
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          Dynamic func = args[0]->runObject(ctx);
          BCR_CHECK;
 #if (HXCPP_API_LEVEL>=500)
@@ -794,6 +860,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          Dynamic func = args[0]->runObject(ctx);
          BCR_CHECK;
          return thisVal->filter(func).mPtr;
@@ -803,16 +870,20 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          return thisVal->iterator().mPtr;
       }
       if (FUNC==afKeyValueIterator)
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_CHECK;
+         CPPIA_CHECK(thisVal);
          return thisVal->keyValueIterator().mPtr;
       }
 
-      if (FUNC==afPush || FUNC==afContains || FUNC==afRemove || FUNC==afIndexOf || FUNC==afLastIndexOf)
+      if (FUNC==afContains || FUNC==afRemove)
+         return Dynamic(runInt(ctx)!=0).mPtr;
+      if (FUNC==afPush || FUNC==afIndexOf || FUNC==afLastIndexOf)
          return Dynamic(runInt(ctx)).mPtr;
 
       if (FUNC==afJoin || FUNC==afToString)
@@ -827,18 +898,21 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_VCHECK;
+         CPPIA_CHECK(thisVal);
          thisVal->pop();
       }
       if (FUNC==afShift)
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_VCHECK;
+         CPPIA_CHECK(thisVal);
          thisVal->shift();
       }
       if (FUNC==af__set)
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_VCHECK;
+         CPPIA_CHECK(thisVal);
          int i = args[0]->runInt(ctx);
          BCR_VCHECK;
          ELEM elem;
@@ -853,6 +927,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_VCHECK;
+         CPPIA_CHECK(thisVal);
          int idx = args[0]->runInt(ctx);
          BCR_VCHECK;
          ELEM &elem = thisVal->Item(idx);
@@ -874,12 +949,14 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_VCHECK;
+         CPPIA_CHECK(thisVal);
          thisVal->reverse();
       }
       if (FUNC==afSort)
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_VCHECK;
+         CPPIA_CHECK(thisVal);
          Dynamic func = args[0]->runObject(ctx);
          BCR_VCHECK;
          thisVal->sort(func);
@@ -888,6 +965,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_VCHECK;
+         CPPIA_CHECK(thisVal);
          int pos = args[0]->runInt(ctx);
          BCR_VCHECK;
          ELEM elem;
@@ -899,6 +977,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_VCHECK;
+         CPPIA_CHECK(thisVal);
          ELEM elem;
          runValue(elem,ctx,args[0]);
          BCR_VCHECK;
@@ -908,6 +987,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_VCHECK;
+         CPPIA_CHECK(thisVal);
          int size = args[0]->runInt(ctx);
          BCR_VCHECK;
          thisVal->__SetSizeExact(size);
@@ -917,6 +997,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM>*)thisExpr->runObject(ctx);
          BCR_VCHECK;
+         CPPIA_CHECK(thisVal);
          int size = args[0]->runInt(ctx);
          BCR_VCHECK;
          thisVal->resize(size);
@@ -927,6 +1008,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       {
          Array_obj<ELEM> *thisVal = (Array_obj<ELEM> *)thisExpr->runObject(ctx);
          BCR_VCHECK;
+         CPPIA_CHECK(thisVal);
          int destElem = args[0]->runInt(ctx);
          BCR_VCHECK;
          Dynamic srcArray = args[1]->runObject(ctx);
@@ -989,7 +1071,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
       
             default: ;
                printf("make setter %d\n", op);
-               throw cppiaExprError(this, "Unknown array assignment operator %d", (int)op);
+               throw "setter not implemented";
          }
 
          delete this;
@@ -1225,6 +1307,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
          case afPush:
             {
                thisExpr->genCode(compiler, sJitTemp0, etObject);
+               genNullReferenceExceptionCheck(compiler, sJitTemp0);
                JumpId enough = compiler->compare( cmpI_LESS, sJitTemp0.star(jtInt, ArrayBase::lengthOffset()),
                                                              sJitTemp0.star(jtInt, ArrayBase::allocOffset()) );
 
@@ -1279,7 +1362,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
                }
                else if (sizeof(ELEM)==4)
                {
-                  compiler->move( sJitTemp1.atReg(sJitTemp0,2), tempVal );
+                  compiler->move( sJitTemp1.atReg(sJitTemp0,2,elem4JitType<ELEM>()), tempVal );
                   #ifdef HXCPP_GC_GENERATIONAL
                   if (hx::ContainsPointers<ELEM>())
                      genWriteBarrier(compiler, sJitTemp2, tempVal );
@@ -1313,13 +1396,19 @@ struct ArrayBuiltin : public ArrayBuiltinBase
                JitTemp tempVal(compiler, elemType);
 
                thisExpr->genCode(compiler, thisVal, etObject);
+               genNullReferenceExceptionCheck(compiler, thisVal);
                args[0]->genCode(compiler, index, etInt);
                args[1]->genCode(compiler, tempVal, elemType);
 
                compiler->move(sJitTemp0.as(jtPointer), thisVal);
                compiler->move(sJitTemp1.as(jtInt), index);
+               JumpId negativeIndex = 0;
                if (!unsafe)
                {
+                  // See the aoSet path - a negative index passes the
+                  // unsigned compares and the store lands before the buffer
+                  negativeIndex = compiler->compare( cmpI_SIG_LESS, sJitTemp1.as(jtInt), (int)0 );
+
                   JumpId enoughLength = compiler->compare( cmpI_LESS, sJitTemp1.as(jtInt),
                                                                  sJitTemp0.star(jtInt, ArrayBase::lengthOffset()) );
 
@@ -1355,8 +1444,6 @@ struct ArrayBuiltin : public ArrayBuiltinBase
                if (sizeof(ELEM)==1) // uchar, bool
                {
                   compiler->move( sJitTemp0.atReg(sJitTemp1).as(jtByte), tempVal );
-                  if (destType!=etNull)
-                     compiler->convert(tempVal, elemType, inDest, destType);
                }
                else if (elemType==etString)
                {
@@ -1369,25 +1456,18 @@ struct ArrayBuiltin : public ArrayBuiltinBase
                   #ifdef HXCPP_GC_GENERATIONAL
                   genWriteBarrier(compiler, sJitTemp2, tempVal.as(jtPointer) + StringOffset::Ptr );
                   #endif
-
-                  if (destType!=etNull)
-                     compiler->convert( sJitTemp0.star(jtString), etString, inDest, destType );
                }
                else if (sizeof(ELEM)==2)
                {
                   compiler->move( sJitTemp0.atReg(sJitTemp1,1), tempVal );
-                  if (destType!=etNull)
-                     compiler->convert(tempVal, elemType, inDest, destType);
                }
                else if (sizeof(ELEM)==4)
                {
-                  compiler->move( sJitTemp0.atReg(sJitTemp1,2), tempVal );
+                  compiler->move( sJitTemp0.atReg(sJitTemp1,2,elem4JitType<ELEM>()), tempVal );
                   #ifdef HXCPP_GC_GENERATIONAL
                   if (hx::ContainsPointers<ELEM>())
                      genWriteBarrier(compiler, sJitTemp2, tempVal );
                   #endif
-                  if (destType!=etNull)
-                     compiler->convert(tempVal, elemType, inDest, destType);
                }
                else if (sizeof(ELEM)==8)
                {
@@ -1396,14 +1476,19 @@ struct ArrayBuiltin : public ArrayBuiltinBase
                   if (hx::ContainsPointers<ELEM>())
                      genWriteBarrier(compiler, sJitTemp2, tempVal );
                   #endif
-                  if (destType!=etNull)
-                     compiler->convert(tempVal, elemType, inDest, destType);
                }
                else
                {
                   printf("Unknown element size\n");
                }
 
+               // The skipped store still produces the right-hand side as the
+               // expression result.  The string branch used to convert from
+               // the stored slot; tempVal holds the same value.
+               if (negativeIndex)
+                  compiler->comeFrom(negativeIndex);
+               if (destType!=etNull)
+                  compiler->convert(tempVal, elemType, inDest, destType);
 
                break;
             }
@@ -1414,6 +1499,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
             {
                JitTemp thisVal(compiler,jtPointer);
                thisExpr->genCode(compiler, thisVal, etObject);
+               genNullReferenceExceptionCheck(compiler, thisVal);
 
                if (destType==etObject)
                {
@@ -1477,14 +1563,18 @@ struct ArrayBuiltin : public ArrayBuiltinBase
                   if (destType!=etInt || isMemoryVal(inDest))
                   {
                      compiler->move(sJitTemp1.as(jtInt),sJitTemp1.atReg(sJitTemp0,1).as(jtShort));
-                     compiler->convert(sJitTemp1,etInt, inDest, destType);
+                     compiler->convert(sJitTemp1.as(jtInt),etInt, inDest, destType);
                   }
                   else
                      compiler->move( inDest.as(jtInt),  sJitTemp1.atReg(sJitTemp0).as(jtShort) );
                }
+               else if (sizeof(ELEM)==4 && elemType==etFloat)
+               {
+                  compiler->move(sJitTempF0, sJitTemp1.atReg(sJitTemp0,2,jtFloat32) );
+                  compiler->convert( sJitTempF0, elemType, inDest, destType );
+               }
                else if (sizeof(ELEM)==4)
                {
-                  // todo - float?
                   if (destType!=elemType || isMemoryVal(inDest))
                   {
                      compiler->move(sJitTemp0.as(elemType==etObject ? jtPointer : jtInt), sJitTemp1.atReg(sJitTemp0,2) );
@@ -1526,6 +1616,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
             {
                JitTemp thisVal(compiler, jtPointer);
                thisExpr->genCode(compiler, thisVal, etObject);
+               genNullReferenceExceptionCheck(compiler, thisVal);
 
                ExprType elemType = (ExprType)ExprTypeOf<ELEM>::value;
                JitTemp val(compiler,getJitType(elemType));
@@ -1543,6 +1634,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
 
                // sJitTemp1 = this
                thisExpr->genCode(compiler, sJitTemp1.as(jtPointer), etObject);
+               genNullReferenceExceptionCheck(compiler, sJitTemp1.as(jtPointer));
                // sJitTemp0 = length
                compiler->move( sJitTemp0.as(jtInt), sJitTemp1.star(jtInt, ArrayBase::lengthOffset()) );
 
@@ -1586,8 +1678,16 @@ struct ArrayBuiltin : public ArrayBuiltinBase
                      compiler->move( sJitTemp2.as(regType), sJitTemp1.atReg(sJitTemp0,shift).as(jt) );
                      // zero out value...
                      compiler->move( sJitTemp1.atReg(sJitTemp0,shift).as(jt), zero );
-                     compiler->convert(sJitTemp2.as(regType), elemType, inDest, destType);
+                     compiler->convert(sJitTemp2.as(regType), elemType, inDest, destType, isBoolElem());
                   }
+               }
+               else if (sizeof(ELEM)==4 && elemType==etFloat)
+               {
+                  if (destType!=etNull && destType!=etVoid)
+                     compiler->move( sJitTempF0, sJitTemp1.atReg(sJitTemp0,2,jtFloat32) );
+                  compiler->move( sJitTemp1.atReg(sJitTemp0,2,jtInt), 0 );
+                  if (destType!=etNull && destType!=etVoid)
+                     compiler->convert( sJitTempF0, elemType, inDest, destType );
                }
                else if (elemType==etString)
                {
@@ -1656,6 +1756,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
             {
                JitTemp thisVal(compiler, jtPointer);
                thisExpr->genCode(compiler, thisVal, etObject);
+               genNullReferenceExceptionCheck(compiler, thisVal);
                args[0]->genCode(compiler, sJitTemp1, etObject);
                compiler->callNative( (void *)runSort, thisVal, sJitTemp1 );
                compiler->checkException();
@@ -1668,6 +1769,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
                JitTemp thisVal(compiler, jtPointer);
                JitTemp value(compiler, jtString);
                thisExpr->genCode(compiler, thisVal, etObject);
+               genNullReferenceExceptionCheck(compiler, thisVal);
                args[0]->genCode(compiler, value, etString);
                compiler->callNative( (void *)runJoin, thisVal, value );
                compiler->checkException();
@@ -1680,6 +1782,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
             {
                JitTemp thisVal(compiler, jtPointer);
                thisExpr->genCode(compiler, thisVal, etObject);
+               genNullReferenceExceptionCheck(compiler, thisVal);
 
                ExprType elemType = (ExprType)ExprTypeOf<ELEM>::value;
                JitTemp val(compiler,getJitType(elemType));
@@ -1696,6 +1799,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
             {
                JitTemp thisVal(compiler, jtPointer);
                thisExpr->genCode(compiler, thisVal, etObject);
+               genNullReferenceExceptionCheck(compiler, thisVal);
 
                ExprType elemType = (ExprType)ExprTypeOf<ELEM>::value;
                JitTemp val(compiler,getJitType(elemType));
@@ -1714,6 +1818,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
             {
                JitTemp thisVal(compiler, jtPointer);
                thisExpr->genCode(compiler, thisVal, etObject);
+               genNullReferenceExceptionCheck(compiler, thisVal);
 
                ExprType elemType = (ExprType)ExprTypeOf<ELEM>::value;
                JitTemp val(compiler,getJitType(elemType));
@@ -1732,6 +1837,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
          case afIterator:
             {
                thisExpr->genCode(compiler, sJitTemp0, etObject);
+               genNullReferenceExceptionCheck(compiler, sJitTemp0);
                compiler->callNative( (void *)runGetIteratator, sJitTemp0.as(jtPointer) );
                compiler->convertReturnReg(etObject, inDest, destType);
                break;
@@ -1739,6 +1845,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
          case afKeyValueIterator:
             {
                thisExpr->genCode(compiler, sJitTemp0, etObject);
+               genNullReferenceExceptionCheck(compiler, sJitTemp0);
                compiler->callNative( (void *)runGetKeyValueIteratator, sJitTemp0.as(jtPointer) );
                compiler->convertReturnReg(etObject, inDest, destType);
                break;
@@ -1749,6 +1856,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
             {
                JitTemp thisVal(compiler, jtPointer);
                thisExpr->genCode(compiler, thisVal, etObject);
+               genNullReferenceExceptionCheck(compiler, thisVal);
 
                JitTemp pos(compiler, jtInt);
                args[0]->genCode(compiler, pos, etInt);
@@ -1766,6 +1874,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
             {
                JitTemp thisVal(compiler,jtPointer);
                thisExpr->genCode(compiler, thisVal, etObject);
+               genNullReferenceExceptionCheck(compiler, thisVal);
                args[0]->genCode(compiler, sJitArg1.as(jtPointer), etObject);
                compiler->callNative( (void *)runConcat, thisVal, sJitArg1.as(jtPointer));
                compiler->convertReturnReg(etObject, inDest, destType);
@@ -1777,6 +1886,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
             {
                JitTemp thisVal(compiler,jtPointer);
                thisExpr->genCode(compiler, thisVal, etObject);
+               genNullReferenceExceptionCheck(compiler, thisVal);
                args[0]->genCode(compiler, sJitArg1.as(jtInt), etInt);
                compiler->callNative( (void *)runSetSizeExact, thisVal, sJitArg1.as(jtInt));
                break;
@@ -1786,6 +1896,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
             {
                JitTemp thisVal(compiler,jtPointer);
                thisExpr->genCode(compiler, thisVal, etObject);
+               genNullReferenceExceptionCheck(compiler, thisVal);
                args[0]->genCode(compiler, sJitArg1.as(jtInt), etInt);
                compiler->callNative( (void *)runResize, thisVal, sJitArg1.as(jtInt));
                break;
@@ -1797,6 +1908,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
                // this, inDestElement, inSourceArray, inSourceElement, inElementCount
                JitMultiArgs fargs(compiler, 5);
                thisExpr->genCode(compiler, fargs.arg(0,jtPointer), etObject);
+               genNullReferenceExceptionCheck(compiler, fargs.arg(0,jtPointer));
                args[0]->genCode(compiler, fargs.arg(1,jtInt), etInt);
                args[1]->genCode(compiler, fargs.arg(2,jtPointer), etObject);
                args[2]->genCode(compiler, fargs.arg(3,jtInt), etInt);
@@ -1813,6 +1925,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
 
                JitTemp thisVal(compiler,jtPointer);
                thisExpr->genCode(compiler, thisVal, etObject);
+               genNullReferenceExceptionCheck(compiler, thisVal);
 
                // sJitTemp0 = index
                args[0]->genCode(compiler, sJitTemp1, etInt);
@@ -1845,12 +1958,14 @@ struct ArrayBuiltin : public ArrayBuiltinBase
          // Array<ELEM>
          case afReverse:
             thisExpr->genCode(compiler, sJitArg0.as(jtPointer), etObject);
+            genNullReferenceExceptionCheck(compiler, sJitArg0.as(jtPointer));
             compiler->callNative( (void *)runReverse, sJitArg0.as(jtPointer) );
             break;
 
          // Array<ELEM>
          case afShift:
             thisExpr->genCode(compiler, sJitArg0.as(jtPointer), etObject);
+            genNullReferenceExceptionCheck(compiler, sJitArg0.as(jtPointer));
             compiler->callNative( (void *)runShift, sJitArg0.as(jtPointer) );
             compiler->convertReturnReg(etObject, inDest, destType, isBoolElem() );
             break;
@@ -1861,6 +1976,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
             {
             JitTemp thisVal(compiler,jtPointer);
             thisExpr->genCode(compiler, thisVal, etObject);
+            genNullReferenceExceptionCheck(compiler, thisVal);
 
             JitTemp pos(compiler,jtInt);
             args[0]->genCode(compiler, pos, etInt);
@@ -1879,6 +1995,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
             {
             JitTemp thisVal(compiler,jtPointer);
             thisExpr->genCode(compiler, thisVal, etObject);
+            genNullReferenceExceptionCheck(compiler, thisVal);
 
             JitTemp pos(compiler,jtInt);
             args[0]->genCode(compiler, pos, etInt);
@@ -1900,6 +2017,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
          // Array<ELEM>
          case afToString:
             thisExpr->genCode(compiler, sJitArg0, etObject);
+            genNullReferenceExceptionCheck(compiler, sJitArg0);
             if (destType==etString)
             {
                compiler->callNative( (void *)runToString, sJitArg0, inDest);
@@ -1918,6 +2036,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
          // Array<ELEM>
          case afCopy:
             thisExpr->genCode(compiler, sJitArg0, etObject);
+            genNullReferenceExceptionCheck(compiler, sJitArg0);
             compiler->callNative( (void *)runCopy, sJitArg0);
             compiler->convertReturnReg(etObject, inDest, destType );
             break;
@@ -1928,6 +2047,7 @@ struct ArrayBuiltin : public ArrayBuiltinBase
             {
             JitTemp thisVal(compiler,jtPointer);
             thisExpr->genCode(compiler, thisVal, etObject);
+            genNullReferenceExceptionCheck(compiler, thisVal);
             args[0]->genCode(compiler, sJitArg1.as(jtPointer), etObject);
 
             compiler->callNative( (void *)runProcess, thisVal, sJitArg1.as(jtPointer));
@@ -1955,7 +2075,7 @@ template<int BUILTIN,typename CREMENT>
 CppiaExpr *TCreateArrayBuiltin(CppiaExpr *inSrc, ArrayType inType, CppiaExpr *thisExpr, Expressions &args, bool inUnsafe = false)
 {
    if (gArrayArgCount[BUILTIN]!=args.size())
-      throw cppiaExprError(inSrc, "Array function takes %d arguments but the script passes %d", (int)gArrayArgCount[BUILTIN], (int)args.size());
+      throw "Bad arg count for array builtin";
 
    switch(inType)
    {
@@ -1976,7 +2096,7 @@ CppiaExpr *TCreateArrayBuiltin(CppiaExpr *inSrc, ArrayType inType, CppiaExpr *th
       default:
          break;
    }
-   throw cppiaExprError(inSrc, "Unknown array type %d", (int)inType);
+   throw "Unknown array type";
    return 0;
 }
 

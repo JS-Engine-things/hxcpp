@@ -184,6 +184,14 @@ int sCtxReg = SLJIT_S0;
 int sFrameReg = SLJIT_S1;
 int sThisReg = SLJIT_S2;
 
+// Called from jitted prologues when the script stack limit is hit.  Jitted
+// code cannot unwind C++ exceptions, so follow the runtime convention:
+// store the exception and let the emitted checkException route it.
+static void cppiaJitStackOverflow(CppiaCtx *inCtx)
+{
+   inCtx->exception = Dynamic(HX_CSTRING("Stack Overflow")).mPtr;
+}
+
 JitReg sJitCtx(SLJIT_S0,jtPointer);
 JitReg sJitFrame(SLJIT_S1,jtPointer);
 JitReg sJitThis(SLJIT_S2,jtPointer);
@@ -191,6 +199,7 @@ JitReg sJitThis(SLJIT_S2,jtPointer);
 
 JitVal sJitCtxFrame = sJitCtx.star(jtPointer, offsetof(CppiaCtx,frame));
 JitVal sJitCtxPointer = sJitCtx.star(jtPointer, offsetof(CppiaCtx,pointer));
+JitVal sJitCtxStackEnd = sJitCtx.star(jtPointer, offsetof(CppiaCtx,stackEnd));
 
 static double sZero = 0.0;
 
@@ -305,7 +314,7 @@ public:
       }
       saveds = 3;
       int fsaveds = 0;
-      #if defined(HXCPP_M64) || defined(HXCPP_ARM64)
+      #ifdef HXCPP_M64
       // Add shadow space for native calls
       int scratches = std::max(maxTempCount + (makesNativeCalls?4:0) ,inArgs);
       #else
@@ -328,6 +337,16 @@ public:
       frameSize = baseFrameSize;
       uncaught.setSize(0);
       catching = 0;
+
+      if (usesFrame && makesNativeCalls)
+      {
+         // Deep jit-to-jit recursion bypasses the interpreter's stack check.
+         // Emitted after the throw lists reset so the exception jump binds.
+         JumpId stackOk = compare( cmpP_LESS, sJitCtxPointer, sJitCtxStackEnd, 0 );
+         callNative( (void *)cppiaJitStackOverflow, sJitCtx.as(jtPointer) );
+         checkException();
+         comeFrom(stackOk);
+      }
    }
 
    CppiaFunc finishGeneration() HXCPP_OVERRIDE
@@ -473,7 +492,6 @@ public:
    {
       sljit_sw t0 = getTarget(v0);
       sljit_sw t1 = getTarget(v1);
-      // TODO - multiple JumpId...
       if (compiler)
       {
          bool jumpOnNan = condition==cmpD_NOT_EQUAL;
@@ -619,6 +637,15 @@ public:
    }
 
 
+   // The prologue only loads the frame and this registers when something uses them
+   void noteSavedReg(int inReg)
+   {
+      if (inReg==sFrameReg)
+         usesFrame = true;
+      else if (inReg==sThisReg)
+         usesThis = true;
+   }
+
    sljit_s32 getTarget(const JitVal &inVal)
    {
       switch(inVal.position)
@@ -641,13 +668,10 @@ public:
          case jposLocal:
             return SLJIT_MEM1(SLJIT_SP);
 
-         case jposArray:
-            setError("TODO");
-            break;
-
          case jposStar:
             if (inVal.reg0<=3 && inVal.reg0>=maxTempCount)
                maxTempCount = inVal.reg0;
+            noteSavedReg(inVal.reg0);
             return SLJIT_MEM1(inVal.reg0);
 
          case jposStarReg:
@@ -655,6 +679,8 @@ public:
                maxTempCount = inVal.reg0;
             if (inVal.reg1<=3 && inVal.reg1>=maxTempCount)
                maxTempCount = inVal.reg1;
+            noteSavedReg(inVal.reg0);
+            noteSavedReg(inVal.reg1);
             return SLJIT_MEM2(inVal.reg0,inVal.reg1);
 
 
@@ -745,9 +771,19 @@ public:
    // May required indirect offsets
    void move(const JitVal &inDest, const JitVal &inSrc) HXCPP_OVERRIDE
    {
-      // TODO - better equality test
       if (inDest==inSrc || !inDest.valid())
          return;
+
+      if (inDest.type==jtFloat32 && inSrc.type==jtFloat)
+      {
+         emit_fop1(SLJIT_CONV_F32_FROM_F64, inDest, inSrc);
+         return;
+      }
+      if (inDest.type==jtFloat && inSrc.type==jtFloat32)
+      {
+         emit_fop1(SLJIT_CONV_F64_FROM_F32, inDest, inSrc);
+         return;
+      }
 
       switch(getCommonType(inDest,inSrc))
       {
@@ -803,6 +839,10 @@ public:
    void setMaxPointer() HXCPP_OVERRIDE
    {
       add( sJitCtxPointer, sJitFrame, maxFrameSize );
+      JumpId stackOk = compare( cmpP_LESS, sJitCtxPointer, sJitCtxStackEnd, 0 );
+      callNative( (void *)cppiaJitStackOverflow, sJitCtx.as(jtPointer) );
+      checkException();
+      comeFrom(stackOk);
    }
 
    void makeAddress(const JitVal &outAddress, const JitVal &inSrc)
@@ -893,7 +933,7 @@ public:
                {
                   if (inSrc.uses(SLJIT_R1))
                   {
-                     move(sJitArg0, inSrc);
+                     move(sJitArg0.as(jtInt), inSrc.as(jtInt));
                      add( sJitTemp1, inTarget.getReg(), inTarget.offset );
                      callNative( (void *)intToStr, sJitArg0.as(jtInt), sJitTemp1.as(jtPointer));
                   }
@@ -912,7 +952,7 @@ public:
             case etObject:
                if (inSrc.uses(SLJIT_R1))
                {
-                  move(sJitArg0, inSrc);
+                  move(sJitArg0.as(jtPointer), inSrc.as(jtPointer));
                   add( sJitTemp1, inTarget.getReg(), inTarget.offset );
                   callNative( (void *)objToStr, sJitArg0.as(jtPointer), sJitTemp1.as(jtPointer) );
                }
@@ -933,28 +973,30 @@ public:
          switch(inSrcType)
          {
             case etInt:
-               emit_fop1( SLJIT_CONV_F64_FROM_S32, inTarget.as(jtInt), inSrc.as(jtFloat) );
+               // The destination of int->float is the FLOAT operand - the swapped
+               // tags made register accounting attribute it to the wrong class
+               emit_fop1( SLJIT_CONV_F64_FROM_S32, inTarget.as(jtFloat), inSrc.as(jtInt) );
                break;
 
             case etObject:
-               if (inSrc==sJitTemp1)
                {
-                  move(sJitArg0, inSrc);
-                  makeAddress(sJitTemp1,inTarget);
-                  callNative( (void *)objToFloat, sJitArg0.as(jtPointer), sJitTemp1.as(jtPointer));
-               }
-               else
-               {
+                  JitVal src = inSrc.as(jtPointer);
+                  if (inSrc.uses(SLJIT_R1))
+                  {
+                     move(sJitArg0.as(jtPointer), src);
+                     src = sJitArg0.as(jtPointer);
+                  }
+
                   if (isMemoryVal(inTarget))
                   {
                      makeAddress(sJitTemp1,inTarget);
-                     callNative( (void *)objToFloat, inSrc.as(jtPointer), sJitTemp1.as(jtPointer) );
+                     callNative( (void *)objToFloat, src, sJitTemp1.as(jtPointer) );
                   }
                   else
                   {
                      JitTemp temp(this,jtFloat);
                      makeAddress(sJitTemp1,temp);
-                     callNative( (void *)objToFloat, inSrc.as(jtPointer), sJitTemp1.as(jtPointer) );
+                     callNative( (void *)objToFloat, src, sJitTemp1.as(jtPointer) );
                      move(inTarget,temp);
                   }
                }
@@ -973,7 +1015,7 @@ public:
          switch(inSrcType)
          {
             case etFloat:
-               emit_fop1( SLJIT_CONV_S32_FROM_F64, inTarget.as(jtFloat), inSrc.as(jtInt) );
+               emit_fop1( SLJIT_CONV_S32_FROM_F64, inTarget.as(jtInt), inSrc.as(jtFloat) );
                break;
 
             case etObject:
@@ -1523,6 +1565,7 @@ public:
 
 void CppiaCompiler::freeCompiled(CppiaFunc inFunc)
 {
+   sljit_free_code((void *)inFunc);
 }
 
 CppiaCompiler *CppiaCompiler::create(int inFrameSize)

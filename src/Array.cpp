@@ -20,21 +20,36 @@ namespace
 #endif
             SorterFunc;
 
+        // Holds the array itself, not a pointer into its buffer: if the
+        // caller does not use the array after the sort, the sorter is all
+        // that keeps it, and its elements, alive through a collection in the
+        // comparator.  The two elements are copied out first, so the
+        // comparator is not handed references into a buffer a moving
+        // collection could relocate.  The comparator may also shorten the
+        // array or release its buffer, so an element past the current
+        // length is not read: it compares as equal.
         struct ArraySorter
         {
-            ELEM* mArray;
+            hx::ArrayBase* mArray;
             SorterFunc mSorter;
 
-            ArraySorter(ELEM* inArray, SorterFunc inSorter) : mArray(inArray), mSorter(inSorter) {};
+            ArraySorter(hx::ArrayBase* inArray, SorterFunc inSorter) : mArray(inArray), mSorter(inSorter) {};
 
             bool operator()(int inA, int inB)
             {
-                return mSorter(mArray[inA], mArray[inB]) < 0;
+                if (inA >= mArray->length || inB >= mArray->length)
+                {
+                    return false;
+                }
+                ELEM* base = (ELEM*)mArray->GetBase();
+                ELEM a = base[inA];
+                ELEM b = base[inB];
+                return mSorter(a, b) < 0;
             }
         };
 
         template<class STORE>
-        static void SortImpl(ELEM* inArray, const int inLength, SorterFunc inSorter)
+        static void SortImpl(hx::ArrayBase* inArray, const int inLength, SorterFunc inSorter)
         {
             auto index = std::vector<STORE>(inLength);
             for (auto i = 0; i < inLength; i++)
@@ -42,9 +57,17 @@ namespace
                 index[i] = static_cast<STORE>(i);
             }
 
-            std::stable_sort(index.begin(), index.end(), ArraySorter(inArray, inSorter));
+            ArraySorter sorter(inArray, inSorter);
+            hx::StableSort(index.data(), inLength, sorter);
 
-            // Put the results back ...
+            // Put the results back ... unless the comparator changed the
+            // length, which leaves the index describing elements that are
+            // gone.  It may have moved the buffer too, so read it again.
+            if (inArray->__length() != inLength)
+            {
+                return;
+            }
+            ELEM* base = (ELEM*)inArray->GetBase();
             for (int i = 0; i < inLength; i++)
             {
                 int from = index[i];
@@ -52,14 +75,14 @@ namespace
                     from = index[from];
                 if (from != i)
                 {
-                    std::swap(inArray[i], inArray[from]);
+                    std::swap(base[i], base[from]);
                     index[i] = from;
                 }
             }
         }
 
     public:
-        static void Sort(ELEM* base, const int length, SorterFunc sorter)
+        static void Sort(hx::ArrayBase* array, const int length, SorterFunc sorter)
         {
             if (length < 2)
             {
@@ -68,15 +91,15 @@ namespace
 
             if (length <= std::numeric_limits<uint8_t>::max())
             {
-                SortImpl<uint8_t>(base, length, sorter);
+                SortImpl<uint8_t>(array, length, sorter);
             }
             else if (length <= std::numeric_limits<uint16_t>::max())
             {
-                SortImpl<uint16_t>(base, length, sorter);
+                SortImpl<uint16_t>(array, length, sorter);
             }
             else
             {
-                SortImpl<uint32_t>(base, length, sorter);
+                SortImpl<uint32_t>(array, length, sorter);
             }
         }
     };
@@ -95,11 +118,17 @@ Array<Dynamic> ArrayBase::__new(int inSize,int inReserve)
 
 ArrayBase::ArrayBase(int inSize,int inReserve,int inElementSize,bool inAtomic)
 {
-   length = inSize;
    int alloc = inSize < inReserve ? inReserve : inSize;
+   if ((unsigned int)alloc > 0x7fffffffU/inElementSize)
+   {
+      mBase = 0;
+      mAlloc = length = 0;
+      hx::Throw( HX_CSTRING("Array allocation too large") );
+   }
+   length = inSize;
    if (alloc)
    {
-      mBase = (char *)hx::InternalNew(alloc * inElementSize,false);
+      mBase = (char *)hx::InternalNew((size_t)alloc * inElementSize,false);
       HX_OBJ_WB_GET(this,mBase);
 #ifdef HXCPP_TELEMETRY
       __hxt_new_array(mBase, alloc * inElementSize);
@@ -119,6 +148,11 @@ void ArrayBase::reserve(int inSize) const
    if (mAlloc<inSize)
    {
       int elemSize = GetElementSize();
+      // Guard the byte count before multiplying - inSize*elemSize can exceed
+      // 2^31 and wrap negative, which would corrupt the heap via an
+      // undersized allocation while length/mAlloc are set to inSize.
+      if (inSize > 0x7fffffff/elemSize)
+         hx::Throw( HX_CSTRING("Array allocation too large") );
       int bytes = inSize * elemSize;
 
       if (mBase)
@@ -127,11 +161,11 @@ void ArrayBase::reserve(int inSize) const
          if (wasUnamanaged)
          {
             char *base=(char *)hx::InternalNew(bytes,false);
-            memcpy(base,mBase,length*elemSize);
+            memcpy(base,mBase,(size_t)length*elemSize);
             mBase = base;
          }
          else
-            mBase = (char *)hx::InternalRealloc(length*elemSize,mBase, bytes );
+            mBase = (char *)hx::InternalRealloc((size_t)length*elemSize,mBase, bytes );
       }
       else
       {
@@ -150,6 +184,8 @@ void ArrayBase::reserve(int inSize) const
 void ArrayBase::Realloc(int inSize) const
 {
    // Try to detect "push" case vs resizing to big array size explicitly by looking at gap
+   if (inSize<0)
+      hx::Throw( HX_CSTRING("Array allocation too large") );
    bool pushCase = (inSize<=mAlloc + 16);
    if (!pushCase)
    {
@@ -159,6 +195,11 @@ void ArrayBase::Realloc(int inSize) const
    {
       int newAlloc = inSize;
       unsigned int elemSize = GetElementSize();
+      // Keep minBytes <= 2^31-1 so the roundup doubling below terminates
+      // (with larger values roundup wraps to 0 and loops forever) and the
+      // byte count stays representable as a positive int.
+      if ((unsigned int)inSize > (0x7fffffffU-8)/elemSize)
+         hx::Throw( HX_CSTRING("Array allocation too large") );
       unsigned int minBytes = inSize*elemSize + 8;
       unsigned int roundup = 64;
       while(roundup<minBytes)
@@ -178,12 +219,12 @@ void ArrayBase::Realloc(int inSize) const
          if (wasUnamanaged)
          {
             char *base=(char *)hx::InternalNew(bytes,false);
-            memcpy(base,mBase,length*elemSize);
+            memcpy(base,mBase,(size_t)length*elemSize);
             mBase = base;
          }
          else
          {
-            mBase = (char *)hx::InternalRealloc(length*elemSize,mBase, bytes, true);
+            mBase = (char *)hx::InternalRealloc((size_t)length*elemSize,mBase, bytes, true);
             int o = bytes;
             bytes = hx::ObjectSizeSafe(mBase);
          }
@@ -218,11 +259,12 @@ void ArrayBase::zero(Dynamic inFirst, Dynamic inCount)
    if (count<0)
       return;
 
-   if (first+count > length)
+   // Overflow-safe clamp - first+count can wrap for huge count
+   if (count > length - first)
       count = length - first;
 
    int size = GetElementSize();
-   memset(mBase + first*size, 0, count*size);
+   memset(mBase + (size_t)first*size, 0, (size_t)count*size);
 }
 
 int ArrayBase::Memcmp(ArrayBase *inOther)
@@ -240,7 +282,8 @@ void ArrayBase::Blit(int inDestElement, ArrayBase *inSourceArray, int inSourceEl
 {
    int srcSize = inSourceArray->GetElementSize();
    int srcElems = inSourceArray->length;
-   if (inDestElement<0 || inSourceElement<0 || inSourceElement+inElementCount>srcElems)
+   if (inDestElement<0 || inSourceElement<0 || inElementCount<0 ||
+        inElementCount > srcElems-inSourceElement || inElementCount > 0x7fffffff-inDestElement)
       hx::Throw( HX_CSTRING("blit out of bounds") );
    if (srcSize!=GetElementSize())
       hx::Throw( HX_CSTRING("blit array mismatch") );
@@ -249,13 +292,17 @@ void ArrayBase::Blit(int inDestElement, ArrayBase *inSourceArray, int inSourceEl
    if (newSize>length)
       resize(newSize);
 
-   const char *src = inSourceArray->mBase + inSourceElement*srcSize;
-   char *dest = mBase + inDestElement*srcSize;
-   int len = inElementCount*srcSize;
-   if (src+len < dest || dest+len<src)
-      memcpy(dest,src,len);
-   else
-      memmove(dest,src,len);
+   const char *src = inSourceArray->mBase + (size_t)inSourceElement*srcSize;
+   char *dest = mBase + (size_t)inDestElement*srcSize;
+   size_t len = (size_t)inElementCount*srcSize;
+   // memcpy and memmove are undefined on a null buffer even for zero bytes
+   if (len>0)
+   {
+      if (src+len < dest || dest+len<src)
+         memcpy(dest,src,len);
+      else
+         memmove(dest,src,len);
+   }
 
    HX_OBJ_WB_PESSIMISTIC_GET(this);
 }
@@ -288,13 +335,16 @@ void ArrayBase::__SetSizeExact(int inSize)
 {
    if (inSize==0)
    {
-      InternalReleaseMem(mBase);
+      if (mAlloc>=0)
+         InternalReleaseMem(mBase);
       mBase = 0;
       mAlloc = length = 0;
    }
    else if (inSize!=length || inSize!=mAlloc)
    {
       int elemSize = GetElementSize();
+      if ((unsigned int)inSize > 0x7fffffffU/elemSize)
+         hx::Throw( HX_CSTRING("Array allocation too large") );
       int bytes = inSize * elemSize;
       if (mBase)
       {
@@ -303,11 +353,11 @@ void ArrayBase::__SetSizeExact(int inSize)
          if (wasUnamanaged)
          {
             char *base=(char *)(AllocAtomic() ? hx::NewGCPrivate(0,bytes) : hx::NewGCBytes(0,bytes));
-            memcpy(base,mBase,std::min(length,inSize)*elemSize);
+            memcpy(base,mBase,(size_t)std::min(length,inSize)*elemSize);
             mBase = base;
          }
          else
-            mBase = (char *)hx::InternalRealloc(length*elemSize,mBase, bytes );
+            mBase = (char *)hx::InternalRealloc((size_t)length*elemSize,mBase, bytes );
       }
       else if (AllocAtomic())
       {
@@ -350,7 +400,7 @@ void ArrayBase::Insert(int inPos)
    {
       resize(length+1);
       int s = GetElementSize();
-      memmove(mBase + inPos*s + s, mBase+inPos*s, (length-inPos-1)*s );
+      memmove(mBase + (size_t)inPos*s + s, mBase+(size_t)inPos*s, (size_t)(length-inPos-1)*s );
    }
 }
 
@@ -368,18 +418,26 @@ void ArrayBase::Splice(ArrayBase *outResult,int inPos,int inLen)
    }
    if (inLen<=0)
       return;
-   if (inPos+inLen>length)
+   // Overflow-safe clamp - inPos+inLen can wrap for huge inLen
+   if (inLen > length - inPos)
       inLen = length - inPos;
 
    int s = GetElementSize();
    if (outResult)
    {
       outResult->resize(inLen);
-      memcpy(outResult->mBase, mBase+inPos*s, s*inLen);
-      // todo - only needed if we have dirty pointer elements
-      HX_OBJ_WB_PESSIMISTIC_GET(outResult);
+      if (inLen>0)
+         memcpy(outResult->mBase, mBase+(size_t)inPos*s, (size_t)s*inLen);
+#ifdef HXCPP_GC_GENERATIONAL
+      // Only needed if we have pointer elements - primitive (atomic) arrays
+      // carry no GC refs, so skip the remembered-set push entirely.
+      if (!AllocAtomic())
+         HX_OBJ_WB_PESSIMISTIC_GET(outResult);
+#endif
    }
-   memmove(mBase+inPos*s, mBase + (inPos+inLen)*s, (length-(inPos+inLen))*s);
+   int after = length-(inPos+inLen);
+   if (after>0)
+      memmove(mBase+(size_t)inPos*s, mBase + (size_t)(inPos+inLen)*s, (size_t)after*s);
    resize(length-inLen);
 }
 
@@ -402,9 +460,13 @@ void ArrayBase::Slice(ArrayBase *outResult,int inPos,int inEnd)
    {
       outResult->resize(n);
       int s = GetElementSize();
-      memcpy(outResult->mBase, mBase+inPos*s, n*s);
-      // todo - only needed if we have dirty pointer elements
-      HX_OBJ_WB_PESSIMISTIC_GET(outResult);
+      memcpy(outResult->mBase, mBase+(size_t)inPos*s, (size_t)n*s);
+#ifdef HXCPP_GC_GENERATIONAL
+      // Only needed if we have pointer elements - primitive (atomic) arrays
+      // carry no GC refs, so skip the remembered-set push entirely.
+      if (!AllocAtomic())
+         HX_OBJ_WB_PESSIMISTIC_GET(outResult);
+#endif
    }
 }
 
@@ -413,7 +475,7 @@ void ArrayBase::RemoveElement(int inPos)
    if (inPos<length)
    {
       int s = GetElementSize();
-      memmove(mBase + inPos*s, mBase+inPos*s + s, (length-inPos-1)*s );
+      memmove(mBase + (size_t)inPos*s, mBase+(size_t)inPos*s + s, (size_t)(length-inPos-1)*s );
       resize(length-1);
    }
 
@@ -423,9 +485,12 @@ void ArrayBase::Concat(ArrayBase *outResult,const char *inSecond,int inLen)
 {
    char *ptr =  outResult->GetBase();
    int n = length * GetElementSize();
-   memcpy(ptr,mBase,n);
+   // Either array may be empty, with no buffer
+   if (n>0)
+      memcpy(ptr,mBase,n);
    ptr += n;
-   memcpy(ptr,inSecond,inLen*GetElementSize());
+   if (inLen>0)
+      memcpy(ptr,inSecond,(size_t)inLen*GetElementSize());
    HX_OBJ_WB_PESSIMISTIC_GET(this);
 }
 
@@ -436,28 +501,31 @@ String ArrayBase::joinArray(Array_obj<String> *inArray, String inSeparator)
    if (length==0)
       return HX_CSTRING("");
 
-   int len = 0;
+   long long total = 0;
    bool isWChar = false;
    for(int i=0;i<length;i++)
    {
       String strI = inArray->__unsafe_get(i);
       if (strI.raw_ptr())
       {
-         len += strI.length;
+         total += strI.length;
          #ifdef HX_SMART_STRINGS
          if (strI.isUTF16Encoded())
             isWChar = true;
          #endif
       }
       else
-         len += 4;
+         total += 4;
    }
 
-   len += (length-1) * inSeparator.length;
+   total += (long long)(length-1) * inSeparator.length;
    #ifdef HX_SMART_STRINGS
    bool sepIsWide = inSeparator.isUTF16Encoded();
    if (isWChar || sepIsWide)
    {
+      if (total > (0x7fffffff-8)/2)
+         hx::Throw( HX_CSTRING("String too long") );
+      int len = (int)total;
       char16_t *buf = String::allocChar16Ptr(len);
       int pos = 0;
       bool separated = inSeparator.length>0;
@@ -508,6 +576,9 @@ String ArrayBase::joinArray(Array_obj<String> *inArray, String inSeparator)
    }
    #endif
    {
+      if (total > 0x7fffffff-8)
+         hx::Throw( HX_CSTRING("String too long") );
+      int len = (int)total;
       char *buf = hx::NewString(len);
 
       int pos = 0;
@@ -568,9 +639,27 @@ String ArrayBase::joinArray(ArrayBase *inBase, String inSeparator)
 void ArrayBase::safeSort(DynamicSorterFunc inSorter, bool inIsString)
 {
    if (inIsString)
-       SafeSorter<String>::Sort((String *)mBase, length,inSorter);
+   {
+      // The comparator takes Dynamic arguments, so box each String once
+      // rather than two per comparison
+      const int n = length;
+      if (n<2)
+         return;
+      Array<Dynamic> boxed(n, n);
+      {
+         String *s = (String *)GetBase();
+         for(int i=0;i<n;i++)
+            boxed->init(i, Dynamic(s[i]));
+      }
+      SafeSorter<Dynamic>::Sort(boxed.mPtr, n, inSorter);
+      if (length!=n)
+         return;
+      String *s = (String *)GetBase();
+      for(int i=0;i<n;i++)
+         s[i] = boxed[i];
+   }
    else
-       SafeSorter<Dynamic>::Sort((Dynamic *)mBase, length,inSorter);
+       SafeSorter<Dynamic>::Sort(this, length,inSorter);
 }
 
 
@@ -726,7 +815,6 @@ static String sArrayFields[] = {
 
 
 
-// TODO;
 hx::Class ArrayBase::__mClass;
 
 Dynamic ArrayCreateEmpty() { return new Array<Dynamic>(0,0); }
@@ -938,7 +1026,7 @@ namespace cpp
     HX_VARRAY_FUNC(return, ::Dynamic, __unsafe_set, HX_VARRAY_ARG_LIST2(::Dynamic, ::Dynamic), HX_VARRAY_FUNC_LIST2(::Dynamic, ::Dynamic), HX_ARG_LIST2);
     HX_VARRAY_FUNC(, void, blit, HX_VARRAY_ARG_LIST4(int, ::cpp::VirtualArray, int, int), HX_VARRAY_FUNC_LIST4(int, ::cpp::VirtualArray, int, int), HX_ARG_LIST4);
     HX_VARRAY_FUNC(, void, zero, HX_VARRAY_ARG_LIST2(::Dynamic, ::Dynamic), HX_VARRAY_FUNC_LIST2(::Dynamic, ::Dynamic), HX_ARG_LIST2);
-    HX_VARRAY_FUNC(, void, memcmp, HX_VARRAY_ARG_LIST1(::cpp::VirtualArray), HX_VARRAY_FUNC_LIST1(::cpp::VirtualArray), HX_ARG_LIST1);
+    HX_VARRAY_FUNC(return, int, memcmp, HX_VARRAY_ARG_LIST1(::cpp::VirtualArray), HX_VARRAY_FUNC_LIST1(::cpp::VirtualArray), HX_ARG_LIST1);
     HX_VARRAY_FUNC(, void, resize, HX_VARRAY_ARG_LIST1(int), HX_VARRAY_FUNC_LIST1(int), HX_ARG_LIST1);
 
 #else
@@ -1004,7 +1092,7 @@ DEFINE_VARRAY_FUNC1(return,filter);
 DEFINE_VARRAY_FUNC1(,__SetSize);
 DEFINE_VARRAY_FUNC1(,__SetSizeExact);
 DEFINE_VARRAY_FUNC2(,zero);
-DEFINE_VARRAY_FUNC1(,memcmp);
+DEFINE_VARRAY_FUNC1(return,memcmp);
 DEFINE_VARRAY_FUNC1(return,__unsafe_get);
 DEFINE_VARRAY_FUNC2(return,__unsafe_set);
 DEFINE_VARRAY_FUNC4(,blit);
@@ -1134,7 +1222,9 @@ void VirtualArray_obj::EnsureArrayStorage(ArrayStore inStore)
          break;
 
       case arrayEmpty:
-         EnsureBase();
+         // Nothing to converge on - keep the receiver's storage.  This
+         // used to install EnsureBase's byte array labeled arrayInt,
+         // silently truncating every later int push to 8 bits
          break;
 
       case arrayBool:  EnsureBoolStorage(); break;
@@ -1278,6 +1368,12 @@ void VirtualArray_obj::MakeFloatArray()
 void VirtualArray_obj::CreateEmptyArray(int inLen)
 {
    base = new Array_obj<Dynamic>(inLen,inLen);
+   // The new elements are nulls, which only object storage represents.
+   // Leaving the store empty made the resized array report length 0,
+   // turned pop/shift/copy/concat into no-ops, and rewrote the nulls as
+   // 0/false on the first typed push
+   if (inLen > 0)
+      store = arrayObject;
    HX_OBJ_WB_GET(this,base);
 }
 

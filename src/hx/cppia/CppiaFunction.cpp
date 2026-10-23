@@ -12,12 +12,6 @@ static int sTypeSize[] = { 0, 0, sizeof(hx::Object *), sizeof(String), sizeof(Fl
 
 String sInvalidArgCount = HX_CSTRING("Invalid arguement count");
 
-String sUnloadedMessage = HX_CSTRING("Called a function from a cppia class that has been unloaded");
-
-#ifdef CPPIA_JIT
-static void SLJIT_CALL unloadedCompiled(CppiaCtx *ctx);
-#endif
-
 
 #ifdef CPPIA_JIT
 void SLJIT_CALL argToInt(CppiaCtx *ctx) { ctx->pushInt( (* (hx::Object **)(ctx->pointer))->__ToInt() ); }
@@ -34,16 +28,19 @@ ScriptCallable::ScriptCallable(CppiaStream &stream)
    body = 0;
    stackSize = 0;
    data = 0;
-   returnTypeId = stream.getInt();
+   returnTypeId = stream.getTypeId();
    returnType = etVoid;
+   isBoolReturn = false;
    argCount = stream.getInt();
    args.resize(argCount);
    hasDefault.resize(argCount);
    initVals.resize(argCount);
    captureSize = 0;
    hasDefaults = false;
+   staticEntry = false;
    #ifdef CPPIA_JIT
    compiled = 0;
+   ownsCompiled = false;
    #endif
    for(int a=0;a<argCount;a++)
    {
@@ -61,14 +58,17 @@ ScriptCallable::ScriptCallable(CppiaExpr *inBody) : CppiaDynamicExpr(inBody)
 {
    returnTypeId = 0;
    returnType = etVoid;
+   isBoolReturn = false;
    argCount = 0;
    stackSize = 0;
    captureSize = 0;
    hasDefaults = false;
    body = inBody;
    data = 0;
+   staticEntry = false;
    #ifdef CPPIA_JIT
    compiled = 0;
+   ownsCompiled = false;
    #endif
 }
 
@@ -92,6 +92,7 @@ ScriptCallable::ScriptCallable(CppiaModule &inModule,ScriptNamedFunction *inFunc
 {
    returnTypeId = 0;
    returnType = etVoid;
+   isBoolReturn = false;
 
    argCount = 0;
    stackSize = 0;
@@ -103,7 +104,7 @@ ScriptCallable::ScriptCallable(CppiaModule &inModule,ScriptNamedFunction *inFunc
    const char *signature = inFunction->signature;
    int argCount = strlen(signature)-1;
    if (argCount<0)
-      throw cppiaError("Native function %s has an empty signature", inFunction->name ? inFunction->name : "?");
+      throw "ScriptNamedFunction: Invalid arg count";
 
    args.resize(argCount);
    hasDefault.resize(argCount);
@@ -134,14 +135,16 @@ ScriptCallable::ScriptCallable(CppiaModule &inModule,ScriptNamedFunction *inFunc
             arg.storeType = fsObject;
             break;
          default:
-            throw cppiaError("Native function %s has an unsupported type '%c' in its signature \"%s\"", inFunction->name ? inFunction->name : "?", signature[i+1], signature);
+            throw "Bad haxe signature";
       }
    }
    body = new RelayExpr(inFunction->execute);
+   staticEntry = false;
 
    #ifdef CPPIA_JIT
    // magically already compiled for us
    compiled = inFunction->execute;
+   ownsCompiled = false;
    #endif
 }
 
@@ -149,7 +152,7 @@ ScriptCallable::ScriptCallable(CppiaModule &inModule,ScriptNamedFunction *inFunc
 ScriptCallable::~ScriptCallable()
 {
    #ifdef CPPIA_JIT
-   if (compiled && compiled != unloadedCompiled)
+   if (compiled && ownsCompiled)
       CppiaCompiler::freeCompiled(compiled);
    #endif
 }
@@ -162,6 +165,7 @@ CppiaExpr *ScriptCallable::link(CppiaModule &inModule)
    data = &inModule;
 
    returnType = inModule.types[ returnTypeId ]->expressionType;
+   isBoolReturn = inModule.types[ returnTypeId ]->haxeClass==ClassOf<bool>();
    layout.returnType = returnType;
 
    for(int a=0;a<args.size();a++)
@@ -191,6 +195,11 @@ CppiaExpr *ScriptCallable::link(CppiaModule &inModule)
    position.functionName = functionName;
    position.fileName = filename;
    position.fullName = filename;
+   #ifdef HXCPP_STACK_LINE
+   // A breakpoint on the function by name stops where the line hook first
+   // runs in it, the first statement of its body
+   position.firstLineNumber = body ? body->firstLine() : line;
+   #endif
 
    #ifdef HXCPP_DEBUGGER
    position.fileHash = Hash(0,filename);
@@ -207,12 +216,27 @@ CppiaExpr *ScriptCallable::link(CppiaModule &inModule)
 }
 
 #ifdef HXCPP_STACK_SCRIPTABLE
+
+// The base holds this, then the arguments and locals at their stackPos. A
+// frame's scriptStack is base + stackSize in jitted code; the interpreter
+// pushes this and the arguments, then allocates the whole layout again before it
+static unsigned char *scriptableBase(unsigned char *inStack, int stackSize,
+                                     const std::vector<CppiaStackVar> &args, bool inCompiled)
+{
+   if (inCompiled)
+      return inStack - stackSize;
+   int argBytes = 0;
+   for (int i = 0; i < (int)args.size(); i++)
+      argBytes += sTypeSize[args[i].argType];
+   return inStack - stackSize - sizeof(hx::Object *) - argBytes;
+}
+
 void ScriptCallable::getScriptableVariables(unsigned char *inStack, Array<Dynamic> outNames)
 {
-   unsigned char *frame = inStack - stackSize;
+   unsigned char *base = scriptableBase(inStack, stackSize, args, compiled!=0);
 
-   hx::Object *thizz = *(hx::Object **)frame;
-   if (thizz)
+   hx::Object *thizz = *(hx::Object **)base;
+   if (thizz && !staticEntry)
       outNames->push(HX_CSTRING("this"));
 
    for(CppiaStackVarMap::iterator i=varMap.begin();i!=varMap.end();++i)
@@ -225,10 +249,10 @@ void ScriptCallable::getScriptableVariables(unsigned char *inStack, Array<Dynami
 
 bool ScriptCallable::getScriptableValue(unsigned char *inStack, String inName, ::Dynamic &outValue)
 {
-   unsigned char *frame = inStack - stackSize;
-   if (inName == HX_CSTRING("this"))
+   unsigned char *base = scriptableBase(inStack, stackSize, args, compiled!=0);
+   if (inName == HX_CSTRING("this") && !staticEntry)
    {
-      outValue = *(hx::Object **)frame;
+      outValue = *(hx::Object **)base;
       return true;
    }
 
@@ -238,7 +262,7 @@ bool ScriptCallable::getScriptableValue(unsigned char *inStack, String inName, :
       CppiaStackVar *var = i->second;
       if ( var->module->strings[ var->nameId]==inName)
       {
-         outValue = var->getInFrame(frame);
+         outValue = var->getInFrame(base);
          return true;
       }
    }
@@ -249,13 +273,13 @@ bool ScriptCallable::getScriptableValue(unsigned char *inStack, String inName, :
 
 bool ScriptCallable::setScriptableValue(unsigned char *inStack, String inName, ::Dynamic inValue)
 {
-   unsigned char *frame = inStack - stackSize;
+   unsigned char *base = scriptableBase(inStack, stackSize, args, compiled!=0);
    for(CppiaStackVarMap::iterator i=varMap.begin();i!=varMap.end();++i)
    {
       CppiaStackVar *var = i->second;
       if ( var->module->strings[ var->nameId]==inName)
       {
-         var->setInFrame(frame,inValue);
+         var->setInFrame(base,inValue);
          return true;
       }
    }
@@ -358,7 +382,9 @@ void ScriptCallable::genArgs(CppiaCompiler *compiler, CppiaExpr *inThis, Express
                break;
             default: ;
          }
-         compiler->addFrame(var.argType);
+         // The unconditional addFrame below covers this slot - advancing
+         // here as well pushed every subsequent omitted optional arg one
+         // slot past where the callee reads it
       }
       else
       {
@@ -369,6 +395,37 @@ void ScriptCallable::genArgs(CppiaCompiler *compiler, CppiaExpr *inThis, Express
    }
 }
 
+
+void ScriptCallable::genModuleAnchor(CppiaCompiler *compiler)
+{
+   if (staticEntry && data)
+   {
+      compiler->move( sJitTemp0, JitVal( (void *)&data->owner ) );
+      compiler->move( sJitTemp0, sJitTemp0.star(jtPointer,0) );
+      compiler->move( sJitFrame.star(jtPointer,0), sJitTemp0 );
+   }
+}
+
+#ifdef HXCPP_DEBUGGER
+static void SLJIT_CALL zeroLocals(unsigned char *inLocals, void *inSize)
+{
+   memset(inLocals, 0, (size_t)inSize);
+}
+
+// The interpreter zeroes a frame's locals; jitted code writes each before
+// reading it, but the debugger can read any of them at any time
+void ScriptCallable::genZeroLocals(CppiaCompiler *compiler)
+{
+   int argEnd = sizeof(void *);
+   for(int i=0;i<args.size();i++)
+      argEnd += sTypeSize[args[i].argType];
+   if (stackSize > argEnd)
+   {
+      compiler->add(sJitArg1.as(jtPointer), sJitFrame.as(jtPointer), argEnd );
+      compiler->callNative( (void *)zeroLocals, sJitArg1.as(jtPointer), JitVal((void *)(size_t)(stackSize - argEnd)) );
+   }
+}
+#endif
 
 void ScriptCallable::genDefaults(CppiaCompiler *compiler)
 {
@@ -514,16 +571,28 @@ void ScriptCallable::runFunction(CppiaCtx *ctx)
    #ifdef CPPIA_JIT
    if (compiled)
    {
+      {
       AutoFrame frame(ctx);
       //printf("Running compiled code...\n");
       compiled(ctx);
       //printf("Done.\n");
+      }
+      if (ctx->exception)
+      {
+         Dynamic caught = ctx->exception;
+         ctx->exception = nullptr;
+         HX_STACK_DO_THROW(caught);
+      }
    }
    else
    #endif
    {
       if (stackSize)
       {
+         // Unchecked, deep script recursion otherwise memsets straight
+         // past the fixed script stack into the heap
+         if (ctx->pointer + stackSize > ctx->stackEnd)
+            hx::Throw( HX_CSTRING("Stack Overflow") );
          memset(ctx->pointer, 0 , stackSize );
          ctx->pointer += stackSize;
       }
@@ -534,6 +603,8 @@ void ScriptCallable::runFunction(CppiaCtx *ctx)
             if (hasDefault[i])
                args[i].setDefault(ctx, initVals[i]);
       }
+      if (staticEntry && data)
+         *(hx::Object **)ctx->frame = data->owner;
 
       CPPIA_STACK_FRAME(this);
       CPPIA_STACK_LINE(this);
@@ -549,10 +620,18 @@ void ScriptCallable::runFunctionClosure(CppiaCtx *ctx)
    #ifdef CPPIA_JIT
    if (compiled)
    {
+      {
       AutoFrame frame(ctx);
       //printf("Running compiled code...\n");
       compiled(ctx);
       //printf("Done.\n");
+      }
+      if (ctx->exception)
+      {
+         Dynamic caught = ctx->exception;
+         ctx->exception = nullptr;
+         HX_STACK_DO_THROW(caught);
+      }
    }
    else
    #endif
@@ -563,6 +642,8 @@ void ScriptCallable::runFunctionClosure(CppiaCtx *ctx)
             if (hasDefault[i])
                args[i].setDefault(ctx, initVals[i]);
       }
+      if (staticEntry && data)
+         *(hx::Object **)ctx->frame = data->owner;
 
       CPPIA_STACK_FRAME(this);
       CPPIA_STACK_LINE(this);
@@ -575,6 +656,8 @@ void ScriptCallable::addStackVarsSpace(CppiaCtx *ctx)
 {
    if (stackSize)
    {
+      if (ctx->pointer + stackSize > ctx->stackEnd)
+         hx::Throw( HX_CSTRING("Stack Overflow") );
       memset(ctx->pointer, 0 , stackSize );
       ctx->pointer += stackSize;
    }
@@ -633,10 +716,28 @@ static void SLJIT_CALL popFrame(StackContext *inCtx, StackFrame *inFrame)
    inCtx->popFrame(inFrame);
 }
 
-static void onReturn( CppiaCompiler *inCompiler, int stackSize )
+// The StackFrame is a native local at this offset, as the script stack only
+// keeps 4-byte alignment
+static void onReturn( CppiaCompiler *inCompiler, int frameLocal )
 {
-   inCompiler->add(sJitArg1.as(jtPointer), sJitFrame.as(jtPointer), stackSize );
+   inCompiler->add(sJitArg1.as(jtPointer), JitLocalPos(frameLocal).getReg().as(jtPointer), frameLocal );
    inCompiler->callNative( (void *)popFrame, sJitCtx.as(jtPointer), sJitArg1.as(jtPointer));
+}
+
+void ScriptCallable::genPushFrame(CppiaCompiler *compiler, int frameLocal)
+{
+   compiler->move(JitLocalPos(frameLocal + offsetof(StackFrame,position)), (void *)&position );
+      #if defined(HXCPP_STACK_LINE) && defined(HXCPP_DEBUGGER)
+      // As the StackFrame constructor does - the debugger walks these lists
+      compiler->move(JitLocalPos(frameLocal + offsetof(StackFrame,variables)), (void *)0 );
+      compiler->move(JitLocalPos(frameLocal + offsetof(StackFrame,catchables)), (void *)0 );
+      #endif
+      #ifdef HXCPP_STACK_SCRIPTABLE
+      compiler->add(sJitArg1.as(jtPointer), sJitFrame.as(jtPointer), stackSize );
+      compiler->move(JitLocalPos(frameLocal + offsetof(StackFrame,scriptStack)), sJitArg1.as(jtPointer) );
+      #endif
+   compiler->add(sJitArg1.as(jtPointer), JitLocalPos(frameLocal).getReg().as(jtPointer), frameLocal );
+   compiler->callNative( (void *)pushFrame, sJitCtx.as(jtPointer), sJitArg1.as(jtPointer) );
 }
 #endif
 
@@ -645,82 +746,56 @@ void ScriptCallable::compile()
 {
    if (!compiled && body)
    {
-      int size = stackSize;
-      #ifdef HXCPP_STACK_TRACE
-      size += sizeof(StackFrame);
-      #endif
-      CppiaCompiler *compiler = CppiaCompiler::create(size);
+      CppiaCompiler *compiler = CppiaCompiler::create(stackSize);
 
       // First pass calculates size...
+      #ifdef HXCPP_STACK_TRACE
+      int frameLocal = compiler->allocTempSize(sizeof(StackFrame));
+      #endif
+      #ifdef HXCPP_DEBUGGER
+      genZeroLocals(compiler);
+      #endif
       genDefaults(compiler);
+      genModuleAnchor(compiler);
 
       #ifdef HXCPP_STACK_TRACE
-      compiler->move(sJitFrame.star(jtPointer)+(offsetof(StackFrame,position) + stackSize),  (void *)&position );
-      compiler->add(sJitArg1.as(jtPointer), sJitFrame.as(jtPointer), stackSize );
-      compiler->callNative( (void *)pushFrame, sJitCtx.as(jtPointer), sJitArg1.as(jtPointer) );
-
-      compiler->setOnReturn( onReturn, stackSize );
+      genPushFrame(compiler, frameLocal);
+      compiler->setOnReturn( onReturn, frameLocal );
          #ifdef HXCPP_STACK_LINE
-         compiler->setLineOffset( stackSize + offsetof(StackFrame,lineNumber) );
+         compiler->setLineOffset( frameLocal + offsetof(StackFrame,lineNumber) );
          #endif
       #endif
 
       body->genCode(compiler);
 
+      #ifdef HXCPP_STACK_TRACE
+      compiler->freeTempSize(sizeof(StackFrame));
+      #endif
       compiler->beginGeneration(1);
 
       // Second pass does the job
+      #ifdef HXCPP_STACK_TRACE
+      frameLocal = compiler->allocTempSize(sizeof(StackFrame));
+      #endif
+      #ifdef HXCPP_DEBUGGER
+      genZeroLocals(compiler);
+      #endif
       genDefaults(compiler);
+      genModuleAnchor(compiler);
 
       #ifdef HXCPP_STACK_TRACE
-      compiler->move(sJitFrame.star(jtPointer)+(offsetof(StackFrame,position) + stackSize),  (void *)&position );
-      compiler->add(sJitArg1.as(jtPointer), sJitFrame.as(jtPointer), stackSize );
-      compiler->callNative( (void *)pushFrame, sJitCtx.as(jtPointer), sJitArg1.as(jtPointer) );
+      genPushFrame(compiler, frameLocal);
       #endif
 
       body->genCode(compiler);
 
       compiled = compiler->finishGeneration();
+      ownsCompiled = true;
 
       delete compiler;
    }
 }
 #endif
-
-struct UnloadedBody : public CppiaExpr
-{
-   const char *getName() HXCPP_OVERRIDE { return "UnloadedBody"; }
-
-   void runVoid(CppiaCtx *ctx) HXCPP_OVERRIDE
-   {
-      hx::Throw( sUnloadedMessage );
-   }
-
-   int         runInt(CppiaCtx *ctx) HXCPP_OVERRIDE { runVoid(ctx); return 0; }
-   Float       runFloat(CppiaCtx *ctx) HXCPP_OVERRIDE { runVoid(ctx); return 0; }
-   ::String    runString(CppiaCtx *ctx) HXCPP_OVERRIDE { runVoid(ctx); return null(); }
-   hx::Object *runObject(CppiaCtx *ctx) HXCPP_OVERRIDE { runVoid(ctx); return 0; }
-};
-
-static UnloadedBody sUnloadedBody;
-
-#ifdef CPPIA_JIT
-static void SLJIT_CALL unloadedCompiled(CppiaCtx *ctx)
-{
-   TRY_NATIVE
-   hx::Throw( sUnloadedMessage );
-   CATCH_NATIVE
-}
-#endif
-
-void ScriptCallable::deactivate()
-{
-   body = &sUnloadedBody;
-   #ifdef CPPIA_JIT
-   compiled = unloadedCompiled;
-   #endif
-}
-
 
 // --- CppiaClosure ----
 
@@ -788,13 +863,21 @@ public:
          AutoFrame frame(ctx);
          function->compiled(ctx);
          }
-         if (!ctx->exception)
+         if (ctx->exception)
+         {
+            Dynamic caught = ctx->exception;
+            ctx->exception = nullptr;
+            HX_STACK_DO_THROW(caught);
+         }
+
          {
             switch(function->returnType)
             {
                case etFloat:
                   return ctx->getFloat();
                case etInt:
+                  if (function->isBoolReturn)
+                     return (bool)ctx->getInt();
                   return ctx->getInt();
                case etString:
                   return ctx->getString();
@@ -806,10 +889,8 @@ public:
          return null();
       }
       //printf("Not compiled %d!\n", function->captureVars.size());
-      //todo - compiled?
       #endif
 
-      // TODO - stack var space added twice?
       function->runFunctionClosure(ctx);
       ctx->breakContReturn = 0;
 
@@ -818,6 +899,8 @@ public:
          case etFloat:
             return ctx->getFloat( );
          case etInt:
+            if (function->isBoolReturn)
+               return (bool)ctx->getInt( );
             return ctx->getInt( );
          case etString:
             return ctx->getString( );
@@ -877,7 +960,7 @@ public:
 
       int haveArgs = !inArgs.mPtr ? 0 : inArgs->length;
       if (haveArgs>function->argCount)
-         throw sInvalidArgCount;
+         hx::Throw(sInvalidArgCount);
 
       for(int a=0; a<haveArgs; a++)
          pushArgDynamic(ctx,a,inArgs[a]);
@@ -950,6 +1033,8 @@ public:
    void __Mark(hx::MarkContext *__inCtx) HXCPP_OVERRIDE
    {
       HX_MARK_MEMBER(*getThis());
+      if (function->data)
+         HX_MARK_OBJECT(function->data->owner);
       char *base = ((char *)this) + sizeof(CppiaClosure);
       for(int i=0;i<function->captureVars.size();i++)
          function->captureVars[i]->markClosure(base,__inCtx);
@@ -1007,19 +1092,19 @@ CppiaFunction::CppiaFunction(CppiaModule *inCppia,bool inIsStatic,bool inIsDynam
 
 void CppiaFunction::load(CppiaStream &stream,bool inExpectBody)
 {
-   nameId = stream.getInt();
+   nameId = stream.getStringId();
    name = cppia.strings[ nameId ].utf8_str();
    stream.module->creatingFunction = name.c_str();
-   returnType = stream.getInt();
+   returnType = stream.getTypeId();
    argCount = stream.getInt();
    DBGLOG("  Function %s(%d) : %s %s%s\n", name.c_str(), argCount, cppia.typeStr(returnType), isStatic?"static":"instance", isDynamic ? " DYNAMIC": "");
    args.resize(argCount);
    for(int a=0;a<argCount;a++)
    {
       ArgInfo &arg = args[a];
-      arg.nameId = stream.getInt();
+      arg.nameId = stream.getStringId();
       arg.optional = stream.getBool();
-      arg.typeId = stream.getInt();
+      arg.typeId = stream.getTypeId();
       DBGLOG("    arg %c%s:%s\n", arg.optional?'?':' ', cppia.identStr(arg.nameId), cppia.typeStr(arg.typeId) );
    }
    if (inExpectBody)
@@ -1033,15 +1118,23 @@ void CppiaFunction::link( )
    {
       linked = true;
       if (funExpr)
+      {
          funExpr = (ScriptCallable *)(funExpr->link(cppia));
+         // A constructor's frame holds the new object
+         ScriptCallable *callable = dynamic_cast<ScriptCallable *>((CppiaExpr *)funExpr);
+         if (callable && isStatic && name!="new")
+            callable->staticEntry = true;
+      }
    }
 }
 
 #ifdef CPPIA_JIT
 void CppiaFunction::compile()
 {
-   if (funExpr)
-      funExpr->compile();
+   // An abstract function's body is a bare RETURN, not a FUN
+   ScriptCallable *callable = dynamic_cast<ScriptCallable *>((CppiaExpr *)funExpr);
+   if (callable)
+      callable->compile();
 }
 #endif
 

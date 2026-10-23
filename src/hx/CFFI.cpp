@@ -8,6 +8,7 @@
 #include <hx/CFFI.h>
 #include <map>
 #include <string>
+#include <mutex>
 
 #ifdef _MSC_VER
 #pragma warning( disable : 4190 )
@@ -32,6 +33,16 @@ public:
       mMarkSize = 0;
    }
 
+   static void freeAbstractHandle(hx::Object *inObj)
+   {
+      Abstract_obj *abs = dynamic_cast<Abstract_obj *>(inObj);
+      if (abs && abs->mMarkSize && abs->mHandle)
+      {
+         HxFree(abs->mHandle);
+         abs->mHandle = 0;
+      }
+   }
+
    Abstract_obj(int inType,int inSize, finalizer inFinalizer)
    {
       mType = inType;
@@ -43,9 +54,12 @@ public:
          mMarkSize = inSize;
          mHandle = HxAlloc(inSize);
          memset(mHandle,0,mMarkSize);
+         // Without this, the malloc block leaked whenever the abstract
+         // was collected and the plugin relied on GC cleanup
+         SetFinalizer(inFinalizer ? inFinalizer : freeAbstractHandle);
       }
-
-      SetFinalizer(inFinalizer);
+      else
+         SetFinalizer(inFinalizer);
    }
 
 
@@ -127,6 +141,7 @@ public:
       if (inName==HX_CSTRING("_hxcpp_toString"))
       {
          _hxcpp_toString = inValue;
+         HX_OBJ_WB_GET(this, _hxcpp_toString.mPtr);
          return inValue;
       }
       return hx::Object::__SetField(inName, inValue,inCallProp);
@@ -156,18 +171,28 @@ typedef std::map<int,std::string> ReverseKindMap;
 static KindMap sgKindMap;
 static ReverseKindMap sgReverseKindMap;
 
+// Plugins can register kinds from any thread (concurrent cpp.Lib.load) -
+// an unsynchronized counter could mint duplicate kind ids, confusing
+// val_to_kind type checks across plugins
+static std::mutex &KindMutex()
+{
+   static std::mutex m;
+   return m;
+}
 
 int hxcpp_alloc_kind()
 {
+   std::lock_guard<std::mutex> lock(KindMutex());
    return ++sgKinds;
 }
 
 
 void hxcpp_kind_share(int &ioKind,const char *inName)
 {
+   std::lock_guard<std::mutex> lock(KindMutex());
    int &kind = sgKindMap[inName];
    if (kind==0)
-      kind = hxcpp_alloc_kind();
+      kind = ++sgKinds;
    ioKind = kind;
    sgReverseKindMap[kind] = inName;
 }
@@ -179,10 +204,18 @@ String __hxcpp_get_kind(Dynamic inObject)
       return null();
    if (type==(int)(size_t)k_cpp_pointer)
       return HX_CSTRING("cpp.Pointer");
-   ReverseKindMap::const_iterator it = sgReverseKindMap.find(type);
-   if (it==sgReverseKindMap.end())
-      return null();
-   return String::create(it->second.c_str(), it->second.size());
+   // Copy the name under the lock and make the GC string after releasing
+   // it: an allocation can start a collection, which would wait forever for
+   // a thread blocked on this lock
+   std::string name;
+   {
+      std::lock_guard<std::mutex> lock(KindMutex());
+      ReverseKindMap::const_iterator it = sgReverseKindMap.find(type);
+      if (it==sgReverseKindMap.end())
+         return null();
+      name = it->second;
+   }
+   return String::create(name.c_str(), (int)name.size());
 }
 
 
@@ -267,7 +300,10 @@ void * val_data(hx::Object * arg1)
 
 int val_fun_nargs(hx::Object * arg1)
 {
-   if (arg1==0)
+   // Any non-function object reported -1 (faVarArgs) via the default
+   // __ArgCount, so the standard val_fun_nargs(v)==faNotFunction
+   // validation idiom treated arbitrary objects as callable
+   if (arg1==0 || arg1->__GetType()!=vtFunction)
       return faNotFunction;
    return arg1->__ArgCount();
 }
@@ -482,8 +518,15 @@ void val_array_set_size(hx::Object * arg1,int inLen)
 void val_array_push(hx::Object * arg1,hx::Object *inValue)
 {
    hx::ArrayBase *base = dynamic_cast<hx::ArrayBase *>(arg1);
-   if (base==0) return;
-   base->__push(inValue);
+   if (base)
+   {
+      base->__push(inValue);
+      return;
+   }
+   // Dynamically typed arrays silently dropped the push
+   cpp::VirtualArray_obj *va = dynamic_cast<cpp::VirtualArray_obj *>(arg1);
+   if (va)
+      va->push(Dynamic(inValue));
 }
 
 
@@ -558,6 +601,11 @@ typedef Array_obj<unsigned char> *ByteArray;
 // The byte array may be a string or a Array<bytes> depending on implementation
 buffer val_to_buffer(hx::Object * arg1)
 {
+   // Unwrap a dynamically typed wrapper, like the val_array_* accessors -
+   // a byte array travelling as Array<Dynamic> failed val_is_buffer
+   hx::ArrayCommon *common = dynamic_cast< hx::ArrayCommon * >(arg1);
+   if (common)
+      arg1 = common->__GetRealObject();
    ByteArray b = dynamic_cast< ByteArray >(arg1);
    return (buffer)b;
 }
@@ -592,14 +640,18 @@ value buffer_val(buffer b)
 value buffer_to_string(buffer inBuffer)
 {
    ByteArray b = (ByteArray) inBuffer;
-   String str(b->GetBase(),b->length);
-   Dynamic d(str);
+   // Copy: the no-copy String constructor aliased the live buffer (later
+   // appends mutated the "immutable" result) and the string was not
+   // null-terminated, so C-string consumers overread past the array
+   Dynamic d(String::create(b->GetBase(),b->length));
    return (value)d.GetPtr();
 }
 
 
 void buffer_append(buffer inBuffer,const char *inStr)
 {
+   if (!inStr || !*inStr)
+      return;
    ByteArray b = (ByteArray)inBuffer;
    int olen = b->length;
    int len = strlen(inStr);
@@ -786,14 +838,15 @@ hx::Object * val_ocall3(hx::Object * arg1,int arg2,hx::Object * arg3,hx::Object 
 }
 
 
-hx::Object * val_ocallN(hx::Object * arg1,int arg2,hx::Object * arg3) THROWS
+hx::Object * val_ocallN(hx::Object * arg1,int arg2,hx::Object ** arg3, int nCount) THROWS
 {
    if (!arg1) hx::Throw(HX_INVALID_OBJECT);
-#if (HXCPP_API_LEVEL>=500)
-   return hx::invoker::invoke(arg1->__IField(arg2), Dynamic(arg3)).GetPtr();
-#else
-   return arg1->__IField(arg2)->__run(Dynamic(arg3)).GetPtr();
-#endif
+   Dynamic field = arg1->__IField(arg2);
+   if (!field.mPtr) Dynamic::ThrowBadFunctionError();
+   Array<Dynamic> args = Array_obj<Dynamic>::__new(0, nCount);
+   while (nCount-- > 0)
+     args << *arg3++;
+   return field->__Run( args ).GetPtr();
 }
 
 
@@ -926,7 +979,7 @@ void  val_gc(hx::Object * arg1,hx::finalizer arg2) THROWS
 
 void  val_gc_ptr(void * arg1,hxPtrFinalizer arg2) THROWS
 {
-   hx::Throw(HX_CSTRING("Finalizer not supported here"));
+   __hxcpp_add_alloc_finalizer(arg1,arg2,true);
 }
 
 void  val_gc_add_root(hx::Object **inRoot)

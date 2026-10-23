@@ -3,6 +3,7 @@
 
 #include <hx/Tls.h>
 #include <stdio.h>
+#include <atomic>
 
 // Under the current scheme (as defined by HX_HCSTRING/HX_CSTRING in hxcpp.h)
 //  each constant string data is prepended with a 4-byte header that says the string
@@ -34,6 +35,9 @@ HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_enable(bool inEnable);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_collect(bool inMajor=true);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void   __hxcpp_gc_compact();
 HXCPP_EXTERN_CLASS_ATTRIBUTES int   __hxcpp_gc_trace(hx::Class inClass, bool inPrint);
+// A major collection that counts the live objects of each class, in any build.
+// Returns an Array of { name:String, count:Int, bytes:Float }, most bytes first
+HXCPP_EXTERN_CLASS_ATTRIBUTES Dynamic __hxcpp_gc_census();
 HXCPP_EXTERN_CLASS_ATTRIBUTES int   __hxcpp_gc_used_bytes();
 HXCPP_EXTERN_CLASS_ATTRIBUTES double __hxcpp_gc_mem_info(int inWhat);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void  __hxcpp_enter_gc_free_zone();
@@ -113,10 +117,10 @@ namespace hx
 // If inSize is small (<4k) it will be allocated from the immix pool.
 // Larger, and it will be allocated from a separate memory pool
 // inIsObject specifies whether "__Mark"  should be called on the resulting object
-void *InternalNew(int inSize,bool inIsObject);
+void *InternalNew(size_t inSize,bool inIsObject);
 
 // Used internall - realloc array data
-void *InternalRealloc(int inFromSize, void *inData,int inSize,bool inAllowExpansion=false);
+void *InternalRealloc(size_t inFromSize, void *inData,size_t inSize,bool inAllowExpansion=false);
 
 void InternalReleaseMem(void *inMem);
 
@@ -124,7 +128,7 @@ unsigned int ObjectSizeSafe(void *inData);
 
 // Const buffers are allocated outside the GC system, and do not require marking
 // String buffers can optionally have a pre-computed hash appended with this method
-void *InternalCreateConstBuffer(const void *inData,int inSize,bool inAddStringHash=false);
+void *InternalCreateConstBuffer(const void *inData, size_t inSize, bool inAddStringHash=false);
 
 // Called after collection by an unspecified thread
 typedef void (*finalizer)(hx::Object *v);
@@ -154,17 +158,17 @@ void  GCSetFinalizer( hx::Object *, hx::finalizer f );
 // This automatically gets checked when you call "new", but if you are in long-running
 //  loop with no new call, you might starve another thread if you to not check this.
 //  0xffffffff = pause requested
-extern int gPauseForCollect;
+extern std::atomic_uint gPauseForCollect;
 
 
 // Minimum total memory - used + buffer for new objects
-extern int sgMinimumWorkingMemory;
+extern size_t sgMinimumWorkingMemory;
 
 // Minimum free memory - not counting used memory
-extern int sgMinimumFreeSpace;
+extern size_t sgMinimumFreeSpace;
 
 // Also ensure that the free memory is larger than this amount of used memory
-extern int sgTargetFreeSpacePercentage;
+extern size_t sgTargetFreeSpacePercentage;
 
 
 extern HXCPP_EXTERN_CLASS_ATTRIBUTES int gByteMarkID;
@@ -197,12 +201,14 @@ char *NewString(int inLen);
 // The concept of 'private' is from the old conservative Gc method.
 // Now with explicit marking, these functions do the same thing, which is
 //  to allocate some GC memory and optionally copy the 'inData' into those bytes
-HXCPP_EXTERN_CLASS_ATTRIBUTES void *NewGCBytes(void *inData,int inSize);
-HXCPP_EXTERN_CLASS_ATTRIBUTES void *NewGCPrivate(void *inData,int inSize);
+HXCPP_EXTERN_CLASS_ATTRIBUTES void *NewGCBytes(void *inData,size_t inSize);
+HXCPP_EXTERN_CLASS_ATTRIBUTES void *NewGCPrivate(void *inData,size_t inSize);
 
 // Force a collect from the calling thread
 // Only one thread should call this at a time
 int InternalCollect(bool inMajor,bool inCompact);
+// The same, returning the bytes in use without truncating them to int
+size_t InternalCollectBytes(bool inMajor,bool inCompact);
 
 
 // Disable the garbage collector.  It will try to increase its internal buffers to honour extra requests.
@@ -212,6 +218,9 @@ void InternalEnableGC(bool inEnable);
 // Record that fact that external memory has been allocated and associated with a haxe object
 //  eg. BitmapData.  This will help the collector know when to collect
 void GCChangeManagedMemory(int inDelta, const char *inWhy=0);
+// Takes memory counted with GCChangeManagedMemory back off without a safe
+// point or a collection, so finalizers and GC-free zones can call it
+void GCReleaseManagedMemory(size_t inBytes);
 
 // Haxe threads can center GC free zones, where they can't make GC allocation calls, and should not mess with GC memory.
 // This means that they do not need to pause while the GC collections happen, and other threads will not
@@ -228,6 +237,8 @@ class HXCPP_EXTERN_CLASS_ATTRIBUTES AutoGCFreeZone
 public:
 	AutoGCFreeZone() : locked(true) { EnterGCFreeZone(); }
 	~AutoGCFreeZone() { if (locked) ExitGCFreeZone(); }
+	AutoGCFreeZone(const AutoGCFreeZone &) = delete;
+	AutoGCFreeZone &operator=(const AutoGCFreeZone &) = delete;
 
 	void close() { if (locked) ExitGCFreeZone(); locked = false; }
 
@@ -298,15 +309,22 @@ namespace hx
 
 // The size info is stored in the header 8 bits to the right
 #define IMMIX_ALLOC_SIZE_SHIFT  6
+// The largest object a block header can describe; bigger ones are large allocations
+#define IMMIX_MAX_BLOCK_OBJECT_SIZE 16380
 
 // Indicates that __Mark must be called recursively
 #define IMMIX_ALLOC_IS_CONTAINER   0x00800000
+// String allocation reserved 4 bytes after the terminator for a memoized hash
+#define HX_GC_STRING_HASH_SLOT     0x00400000
 // String is char16_t type
 #define HX_GC_STRING_CHAR16_T      0x00200000
 // String has hash data at end
 #define HX_GC_STRING_HASH          0x00100000
 
 #define HX_GC_STRING_HASH_BIT      0x10
+#define HX_GC_STRING_HASH_SLOT_BIT 0x40
+// Shorter strings hash quickly anyway - not worth 4 bytes each
+#define HX_GC_STRING_HASH_SLOT_MIN_LEN 8
 
 #ifdef HXCPP_BIG_ENDIAN
    #define HX_GC_STRING_HASH_OFFSET        -3
@@ -336,8 +354,8 @@ EXTERN_FAST_TLS_DATA(StackContext, tlsStackContext);
 extern StackContext *gMainThreadContext;
 
 extern unsigned int gImmixStartFlag[128];
-extern int gMarkID;
-extern int gMarkIDWithContainer;
+extern unsigned int gMarkID;
+extern unsigned int gMarkIDWithContainer;
 extern void BadImmixAlloc();
 
 
@@ -345,15 +363,15 @@ class ImmixAllocator
 {
 public:
    virtual ~ImmixAllocator() {}
-   virtual void *CallAlloc(int inSize,unsigned int inObjectFlags) = 0;
+   virtual void *CallAlloc(size_t inSize,unsigned int inObjectFlags) = 0;
    virtual void SetupStackAndCollect(bool inMajor, bool inForceCompact, bool inLocked=false,bool inFreeIsFragged=false) = 0;
 
    #ifdef HXCPP_GC_NURSERY
    unsigned char  *spaceFirst;
    unsigned char  *spaceOversize;
    #else
-   int            spaceStart;
-   int            spaceEnd;
+   size_t         spaceStart;
+   size_t         spaceEnd;
    #endif
    unsigned int   *allocStartFlags;
    unsigned char  *allocBase;
@@ -363,29 +381,32 @@ public:
    // These allocate the function using the garbage-collected malloc
    inline static void *alloc(ImmixAllocator *alloc, size_t inSize, bool inContainer, const char *inName )
    {
+      if (inSize > IMMIX_MAX_BLOCK_OBJECT_SIZE)
+         return InternalNew(inSize, inContainer);
+
       #ifdef HXCPP_GC_NURSERY
 
          #ifdef HXCPP_ALIGN_ALLOC
          // make sure buffer is 8-byte aligned
-         unsigned char *buffer = alloc->spaceFirst + ( (size_t)alloc->spaceFirst & 4 );
+         unsigned char* buffer{ alloc->spaceFirst + (reinterpret_cast<uintptr_t>(alloc->spaceFirst) & 4) };
          #else
-         unsigned char *buffer = alloc->spaceFirst;
+         unsigned char* buffer{ alloc->spaceFirst };
          #endif
-         unsigned char *end = buffer + (inSize + 4);
+         unsigned char* end{ buffer + (inSize + 4) };
 
          if ( end > alloc->spaceOversize )
          {
             // Fall back to external method
-            buffer = (unsigned char *)alloc->CallAlloc(inSize, inContainer ? IMMIX_ALLOC_IS_CONTAINER : 0);
+            buffer = static_cast<unsigned char*>(alloc->CallAlloc(inSize, inContainer ? IMMIX_ALLOC_IS_CONTAINER : 0));
          }
          else
          {
             alloc->spaceFirst = end;
 
             if (inContainer)
-               ((unsigned int *)buffer)[-1] = inSize | IMMIX_ALLOC_IS_CONTAINER;
+                reinterpret_cast<unsigned int*>(buffer)[-1] = static_cast<unsigned int>(inSize) | IMMIX_ALLOC_IS_CONTAINER;
             else
-               ((unsigned int *)buffer)[-1] = inSize;
+                reinterpret_cast<unsigned int*>(buffer)[-1] = static_cast<unsigned int>(inSize);
          }
 
          #if defined(HXCPP_GC_CHECK_POINTER) && defined(HXCPP_GC_DEBUG_ALWAYS_MOVE)
@@ -401,30 +422,30 @@ public:
       #else
          // Inline the fast-path if we can
          // We know the object can hold a pointer (vtable) and that the size is int-aligned
-         int start = alloc->spaceStart;
+         size_t start{ alloc->spaceStart };
          #ifdef HXCPP_ALIGN_ALLOC
             // Ensure odd alignment in 8 bytes
-            start += 4 - (start & 4);
+            start += 4 - (start & size_t{ 4 });
          #endif
-         int end = start + (int)(sizeof(int) + inSize);
+          size_t end{ start + sizeof(int) + inSize };
 
          if ( end <= alloc->spaceEnd )
          {
             alloc->spaceStart = end;
 
-            unsigned int *buffer = (unsigned int *)(alloc->allocBase + start);
+            unsigned int* buffer{ reinterpret_cast<unsigned int*>(alloc->allocBase + start) };
 
-            int startRow = start>>IMMIX_LINE_BITS;
+            size_t startRow{ start >> IMMIX_LINE_BITS };
 
             alloc->allocStartFlags[ startRow ] |= gImmixStartFlag[start&127];
 
             if (inContainer)
-               *buffer++ =  (( (end+(IMMIX_LINE_LEN-1))>>IMMIX_LINE_BITS) -startRow) |
-                            ((int)inSize<<IMMIX_ALLOC_SIZE_SHIFT) |
+               *buffer++ =  static_cast<unsigned int>(( (end+(IMMIX_LINE_LEN-1))>>IMMIX_LINE_BITS) -startRow) |
+                            static_cast<unsigned int>(inSize<<IMMIX_ALLOC_SIZE_SHIFT) |
                             hx::gMarkIDWithContainer;
             else
-               *buffer++ =  (( (end+(IMMIX_LINE_LEN-1))>>IMMIX_LINE_BITS) -startRow) |
-                            ((int)inSize<<IMMIX_ALLOC_SIZE_SHIFT) |
+               *buffer++ =  static_cast<unsigned int>(( (end+(IMMIX_LINE_LEN-1))>>IMMIX_LINE_BITS) -startRow) |
+                            static_cast<unsigned int>(inSize<<IMMIX_ALLOC_SIZE_SHIFT) |
                             hx::gMarkID;
 
             #if defined(HXCPP_GC_CHECK_POINTER) && defined(HXCPP_GC_DEBUG_ALWAYS_MOVE)
@@ -439,7 +460,7 @@ public:
          }
 
          // Fall back to external method
-         void *result = alloc->CallAlloc((int)inSize, inContainer ? IMMIX_ALLOC_IS_CONTAINER : 0);
+         void *result = alloc->CallAlloc(inSize, inContainer ? IMMIX_ALLOC_IS_CONTAINER : 0);
 
          #ifdef HXCPP_TELEMETRY
             __hxt_gc_new((hx::StackContext *)alloc,result, inSize, inName);
@@ -494,10 +515,13 @@ inline void MarkAlloc(void *inPtr ,hx::MarkContext *__inCtx)
 {
    #ifdef __EMSCRIPTEN__
    // Unaligned must be constants...
-   if ( !( ((size_t)inPtr) & 3) )
+   if ( ((size_t)inPtr) & 3 )
+      return;
    #endif
    // This will also skip const regions
-   if ( !(((unsigned int *)inPtr)[-1] & gPrevMarkIdMask) )
+   unsigned int header;
+   memcpy(&header, (char *)inPtr - sizeof(header), sizeof(header));
+   if ( !(header & gPrevMarkIdMask) )
       MarkAllocUnchecked(inPtr,__inCtx);
 }
 inline void MarkObjectAlloc(hx::Object *inPtr ,hx::MarkContext *__inCtx)

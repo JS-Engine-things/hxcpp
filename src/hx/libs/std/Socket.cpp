@@ -1,8 +1,10 @@
 #if !defined(HX_WINRT) && !defined(EPPC)
 #include <hxcpp.h>
+#include <chrono>
 #include <hx/OS.h>
 
 #include <string.h>
+#include <stddef.h>
 
 
 #ifdef NEKO_WINDOWS
@@ -25,13 +27,22 @@
 typedef INT (WSAAPI *inet_pton_func)( INT Family, PCSTR pszAddrString, PVOID pAddrBuf);
 typedef PCSTR (WSAAPI *inet_ntop_func)(INT  Family, PVOID pAddr, PSTR pStringBuf, size_t StringBufSize);
 
-#   define FDSIZE(n)   (sizeof(u_int) + (n) * sizeof(SOCKET))
+// fd_array does not begin at sizeof(u_int). On 64-bit Windows SOCKET is
+// eight bytes, so fd_set carries four bytes of padding after fd_count and
+// the array starts at offset 8. Sizing the copy as 4 + n*8 truncated the
+// first handle by half and left the rest as whatever malloc returned, so
+// select() saw a handle that was not a socket and failed with WSAENOTSOCK.
+#   define FDSIZE(n)   (offsetof(fd_set, fd_array) + (n) * sizeof(SOCKET))
 #   define SHUT_WR      SD_SEND
 #   define SHUT_RD      SD_RECEIVE
 #   define SHUT_RDWR   SD_BOTH
    static bool init_done = false;
    static WSADATA init_data;
 typedef int SocketLen;
+// Windows 7 SP1 and later; older SDK and MinGW headers lack the name
+#ifndef WSA_FLAG_NO_HANDLE_INHERIT
+#   define WSA_FLAG_NO_HANDLE_INHERIT 0x80
+#endif
 #else
 #   include <sys/types.h>
 #   include <sys/socket.h>
@@ -70,6 +81,25 @@ struct SocketWrapper : public hx::Object
    SOCKET socket;
 
    int __GetType() const HXCPP_OVERRIDE { return socketType; }
+
+   // A socket that is dropped without close still releases its descriptor
+   static void finalize(Dynamic inObj)
+   {
+      SocketWrapper *wrap = (SocketWrapper *)inObj.mPtr;
+      if (wrap->socket != INVALID_SOCKET)
+      {
+         closesocket(wrap->socket);
+         wrap->socket = INVALID_SOCKET;
+      }
+   }
+
+   static SocketWrapper *create(SOCKET inSocket)
+   {
+      SocketWrapper *wrap = new SocketWrapper();
+      wrap->socket = inSocket;
+      _hx_set_finalizer(wrap, finalize);
+      return wrap;
+   }
 };
 
 
@@ -82,7 +112,9 @@ SOCKET val_sock(Dynamic inValue)
       {
          inValue = inValue->__Field( HX_CSTRING("__s"), hx::paccNever );
          if (inValue.mPtr==0)
-            return 0;
+            // Not 0 - on posix that is stdin and operations would silently
+            // target the console instead of failing
+            return INVALID_SOCKET;
          type = inValue->__GetType();
       }
 
@@ -149,6 +181,12 @@ static void block_error()
 
 }
 
+// For SSL.cpp: the native socket in a handle, or a throw if it is not one
+size_t _hx_std_socket_handle(Dynamic inSocket)
+{
+   return (size_t)val_sock(inSocket);
+}
+
 /**
    socket_init : void -> void
    <doc>
@@ -178,10 +216,29 @@ Dynamic _hx_std_socket_new( bool udp, bool ipv6 )
 
    SOCKET s;
    int family = ipv6 ? AF_INET6 : AF_INET;
-   if( udp )
-      s = socket(family,SOCK_DGRAM,0);
-   else
-      s = socket(family,SOCK_STREAM,0);
+   int type = udp ? SOCK_DGRAM : SOCK_STREAM;
+
+   #ifdef NEKO_WINDOWS
+      // Not inheritable, as posix sockets are close-on-exec below.  A
+      // Winsock handle is inheritable by default, so every process started
+      // while it was open (sys.io.Process, Sys.command) got a copy, and a
+      // connection this process closed stayed open until those exited.
+      // WSASocket with the overlapped flag is what socket() creates
+      s = WSASocketW(family,type,0,NULL,0,WSA_FLAG_OVERLAPPED|WSA_FLAG_NO_HANDLE_INHERIT);
+      if( s == INVALID_SOCKET && WSAGetLastError() == WSAEINVAL )
+      {
+         // Before Windows 7 SP1 the flag is refused - clear it afterwards
+         s = socket(family,type,0);
+         if( s != INVALID_SOCKET )
+            SetHandleInformation((HANDLE)s,HANDLE_FLAG_INHERIT,0);
+      }
+   #elif defined(HX_LINUX) && defined(SOCK_CLOEXEC)
+      // Close-on-exec from the start - set afterwards, a process another
+      // thread started in between inherited the socket anyway
+      s = socket(family,type|SOCK_CLOEXEC,0);
+   #else
+      s = socket(family,type,0);
+   #endif
 
    if( s == INVALID_SOCKET )
       return null();
@@ -191,15 +248,13 @@ Dynamic _hx_std_socket_new( bool udp, bool ipv6 )
       setsockopt(s,SOL_SOCKET,SO_NOSIGPIPE,(void *)&set, sizeof(int));
    #endif
 
-   #ifdef NEKO_POSIX
+   #if defined(NEKO_POSIX) && !(defined(HX_LINUX) && defined(SOCK_CLOEXEC))
       // we don't want sockets to be inherited in case of exec
       int old = fcntl(s,F_GETFD,0);
       if( old >= 0 ) fcntl(s,F_SETFD,old|FD_CLOEXEC);
    #endif
 
-   SocketWrapper *wrap = new SocketWrapper();
-   wrap->socket = s;
-   return wrap;
+   return SocketWrapper::create(s);
 }
 
 /**
@@ -209,9 +264,15 @@ Dynamic _hx_std_socket_new( bool udp, bool ipv6 )
 void _hx_std_socket_close( Dynamic handle )
 {
    SOCKET s = val_sock(handle);
-   POSIX_LABEL(close_again);
-   if( s != INVALID_SOCKET && closesocket(s) ) {
-      HANDLE_EINTR(close_again);
+   if( s != INVALID_SOCKET )
+   {
+      // No EINTR retry: posix close() releases the descriptor even when
+      // interrupted, so retrying can close a descriptor another thread
+      // just received.  A lingering close (SO_LINGER) can block, so let
+      // the GC keep running.
+      hx::EnterGCFreeZone();
+      closesocket(s);
+      hx::ExitGCFreeZone();
    }
    reset_sock(handle);
 }
@@ -247,14 +308,21 @@ int _hx_std_socket_send( Dynamic o, Array<unsigned char> buf, int p, int l )
 {
    SOCKET sock = val_sock(o);
    int dlen = buf->length;
-   if( p < 0 || l < 0 || p > dlen || p + l > dlen )
+   // l > dlen - p, not p + l > dlen: the addition can overflow and skip the check
+   if( p < 0 || l < 0 || p > dlen || l > dlen - p )
       return 0;
 
-   const char *base = (const char *)&buf[0];
+   // volatile: the allocation start must stay visible in this frame so the
+   // conservative scan pins buf while send() reads it from inside the zone
+   const char * volatile base = (const char *)buf->GetBase();
    hx::EnterGCFreeZone();
+   POSIX_LABEL(send_again);
    dlen = send(sock, base + p , l, MSG_NOSIGNAL);
    if( dlen == SOCKET_ERROR )
+   {
+      HANDLE_EINTR(send_again);
       block_error();
+   }
    hx::ExitGCFreeZone();
    return dlen;
 }
@@ -268,15 +336,25 @@ int _hx_std_socket_recv( Dynamic o, Array<unsigned char> buf, int p, int l )
 {
    SOCKET sock = val_sock(o);
    int dlen = buf->length;
-   if( p < 0 || l < 0 || p > dlen || p + l > dlen )
+   if( p < 0 || l < 0 || p > dlen || l > dlen - p )
       return 0;
 
-   char *base = (char *)&buf[0];
+   char * volatile base = (char *)buf->GetBase();
    hx::EnterGCFreeZone();
    POSIX_LABEL(recv_again);
    dlen = recv(sock, base + p, l, MSG_NOSIGNAL);
    if( dlen == SOCKET_ERROR )
    {
+      #ifdef NEKO_WINDOWS
+      // A datagram larger than the buffer fills the buffer but reports
+      // WSAEMSGSIZE - posix silently truncates instead.  Match posix
+      // rather than discarding the data as a bogus "EOF"
+      if( WSAGetLastError() == WSAEMSGSIZE )
+      {
+         hx::ExitGCFreeZone();
+         return l;
+      }
+      #endif
       HANDLE_EINTR(recv_again);
       block_error();
    }
@@ -316,7 +394,7 @@ void _hx_std_socket_write( Dynamic o, Array<unsigned char> buf )
 {
    SOCKET sock = val_sock(o);
    int datalen = buf->length;
-   const char *cdata = (const char *)&buf[0];
+   const char * volatile cdata = (const char *)buf->GetBase();
    int pos = 0;
 
    hx::EnterGCFreeZone();
@@ -345,13 +423,17 @@ Array<unsigned char> _hx_std_socket_read( Dynamic o )
 {
    SOCKET sock = val_sock(o);
    Array<unsigned char> result = Array_obj<unsigned char>::__new();
-   char buf[256];
+   // Read in large chunks: a 256-byte buffer forced one recv() syscall (and
+   // array append) per 256 bytes when slurping a stream to EOF. 16KB cuts that
+   // ~64x while staying small enough for any thread stack and exception-safe
+   // (no heap buffer to leak if block_error throws).
+   char buf[16384];
 
    hx::EnterGCFreeZone();
    while( true )
    {
       POSIX_LABEL(read_again);
-      int len = recv(sock,buf,256,MSG_NOSIGNAL);
+      int len = recv(sock,buf,sizeof(buf),MSG_NOSIGNAL);
       if( len == SOCKET_ERROR ) {
          HANDLE_EINTR(read_again);
          block_error();
@@ -374,6 +456,11 @@ Array<unsigned char> _hx_std_socket_read( Dynamic o )
 **/
 int _hx_std_host_resolve( String host )
 {
+   // inet_addr's error value INADDR_NONE is also the valid limited
+   // broadcast address, which would otherwise fall into DNS and throw
+   if( host == HX_CSTRING("255.255.255.255") )
+      return (int)0xFFFFFFFF;
+
    unsigned int ip;
 
    hx::EnterGCFreeZone();
@@ -384,7 +471,7 @@ int _hx_std_host_resolve( String host )
       struct hostent *h = 0;
       hx::strbuf hostBuf;
 
-#   if defined(NEKO_WINDOWS) || defined(NEKO_MAC) || defined(__EMSCRIPTEN__)
+#   if defined(NEKO_WINDOWS) || defined(NEKO_MAC) || defined(__EMSCRIPTEN__) || defined(NEKO_BSD)
       h = gethostbyname(host.utf8_str(&hostBuf));
 #   else
       struct hostent hbase;
@@ -484,7 +571,19 @@ String _hx_std_host_to_string( int ip )
 {
    struct in_addr i;
    *(int*)&i = ip;
+   #ifdef NEKO_WINDOWS
+   // Winsock keeps inet_ntoa's answer per thread
    return String( inet_ntoa(i) );
+   #else
+   // Not inet_ntoa: on macOS and the BSDs its buffer is one static for the
+   // whole process, which it first fills with "[inet_ntoa error]" and then
+   // formats over, so a thread formatting at the same time as another read
+   // that text back for 127.0.0.1
+   char buf[INET_ADDRSTRLEN];
+   if (!inet_ntop(AF_INET, &i, buf, sizeof(buf)))
+      return String();
+   return String( buf );
+   #endif
 }
 
 
@@ -522,7 +621,7 @@ String _hx_std_host_reverse( int host )
    struct hostent *h = 0;
    unsigned int ip = host;
    hx::EnterGCFreeZone();
-   #if defined(NEKO_WINDOWS) || defined(NEKO_MAC) || defined(ANDROID) || defined(__EMSCRIPTEN__)
+   #if defined(NEKO_WINDOWS) || defined(NEKO_MAC) || defined(ANDROID) || defined(__EMSCRIPTEN__) || defined(NEKO_BSD)
    h = gethostbyaddr((char *)&ip,4,AF_INET);
    #else
    struct hostent htmp;
@@ -543,7 +642,7 @@ String _hx_std_host_reverse_ipv6( Array<unsigned char> host )
 
    struct hostent *h = 0;
    hx::EnterGCFreeZone();
-   #if defined(NEKO_WINDOWS) || defined(NEKO_MAC) || defined(ANDROID) || defined(__EMSCRIPTEN__)
+   #if defined(NEKO_WINDOWS) || defined(NEKO_MAC) || defined(ANDROID) || defined(__EMSCRIPTEN__) || defined(NEKO_BSD)
    h = gethostbyaddr((char *)&host[0],16,AF_INET6);
    #else
    struct hostent htmp;
@@ -587,9 +686,21 @@ void _hx_std_socket_connect( Dynamic o, int host, int port )
    addr.sin_port = htons(port);
    *(int*)&addr.sin_addr.s_addr = host;
 
+   // val_sock does a dynamic field lookup and can throw - neither is
+   // allowed inside the free zone
+   SOCKET sock = val_sock(o);
    hx::EnterGCFreeZone();
-   if( connect(val_sock(o),(struct sockaddr*)&addr,sizeof(addr)) == SOCKET_ERROR )
+   if( connect(sock,(struct sockaddr*)&addr,sizeof(addr)) == SOCKET_ERROR )
    {
+      #ifdef NEKO_POSIX
+      // A signal interrupted a blocking connect: the connection continues
+      // asynchronously (posix), so report "in progress", not EOF
+      if( errno == EINTR )
+      {
+         hx::ExitGCFreeZone();
+         hx::Throw(HX_CSTRING("Blocking"));
+      }
+      #endif
       // This will throw a "Blocking" exception if the "error" was because
       // it's a non-blocking socket with connection in progress, otherwise
       // it will do nothing.
@@ -612,9 +723,17 @@ void _hx_std_socket_connect_ipv6( Dynamic o, Array<unsigned char> host, int port
    addr.sin6_port = htons(port);
    memcpy(&addr.sin6_addr,&host[0],16);
 
+   SOCKET sock = val_sock(o);
    hx::EnterGCFreeZone();
-   if( connect(val_sock(o),(struct sockaddr*)&addr,sizeof(addr)) != 0 )
+   if( connect(sock,(struct sockaddr*)&addr,sizeof(addr)) != 0 )
    {
+      #ifdef NEKO_POSIX
+      if( errno == EINTR )
+      {
+         hx::ExitGCFreeZone();
+         hx::Throw(HX_CSTRING("Blocking"));
+      }
+      #endif
       // This will throw a "Blocking" exception if the "error" was because
       // it's a non-blocking socket with connection in progress, otherwise
       // it will do nothing.
@@ -636,12 +755,10 @@ void _hx_std_socket_listen( Dynamic o, int n )
    if( listen(sock,n) == SOCKET_ERROR )
    {
       hx::ExitGCFreeZone();
-      return;
+      hx::Throw(HX_CSTRING("Listen failed"));
    }
    hx::ExitGCFreeZone();
 }
-
-static fd_set INVALID;
 
 static fd_set *make_socket_array( Array<Dynamic> a, fd_set *tmp, SOCKET *n )
 {
@@ -657,6 +774,15 @@ static fd_set *make_socket_array( Array<Dynamic> a, fd_set *tmp, SOCKET *n )
    {
       // make sure it is a socket...
       SOCKET sock = val_sock( a[i] );
+      if( sock == INVALID_SOCKET )
+         hx::Throw(HX_CSTRING("Closed socket in select"));
+      #ifndef NEKO_WINDOWS
+      // On posix fd_set is a fixed-size bitmap and FD_SET past it smashes
+      // the stack.  (On Windows it is a counted array, where the length
+      // check above is the right one.)
+      if( sock >= FD_SETSIZE )
+         hx::Throw(HX_CSTRING("Socket descriptor too large for select (use poll)"));
+      #endif
       if( sock > *n )
          *n = sock;
       FD_SET(sock,tmp);
@@ -712,6 +838,24 @@ static struct timeval *init_timeval( double f, struct timeval *t ) {
    return t;
 }
 
+#ifdef NEKO_POSIX
+static double monotonicSeconds()
+{
+   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// A finite wait that a signal interrupted goes on for what is left of it,
+// not for its whole length again
+static void remainingTimeval(double inDeadline, struct timeval *t)
+{
+   double left = inDeadline - monotonicSeconds();
+   if (left < 0)
+      left = 0;
+   t->tv_sec = (int)left;
+   t->tv_usec = (int)((left - (int)left) * 1000000);
+}
+#endif
+
 /**
    socket_select : read : 'socket array -> write : 'socket array -> others : 'socket array -> timeout:number? -> 'socket array array
    <doc>Perform the [select] operation. Timeout is in seconds or [null] if infinite</doc>
@@ -721,32 +865,53 @@ Array<Dynamic> _hx_std_socket_select( Array<Dynamic> rs, Array<Dynamic> ws, Arra
    SOCKET n = 0;
    fd_set rx, wx, ex;
    fd_set *ra, *wa, *ea;
+   double deadline = -1;
 
    POSIX_LABEL(select_again);
    ra = make_socket_array(rs,&rx,&n);
    wa = make_socket_array(ws,&wx,&n);
    ea = make_socket_array(es,&ex,&n);
-   if( ra == &INVALID || wa == &INVALID || ea == &INVALID )
-      hx::Throw( HX_CSTRING("No valid sockets") );
 
    struct timeval tval;
    struct timeval *tt = 0;
    if( timeout.mPtr )
       tt = init_timeval(timeout,&tval);
+   #ifdef NEKO_POSIX
+   if (tt)
+   {
+      if (deadline < 0)
+         deadline = monotonicSeconds() + tval.tv_sec + tval.tv_usec * 1e-6;
+      else
+         remainingTimeval(deadline, &tval);
+   }
+   #endif
 
    hx::EnterGCFreeZone();
    if( select((int)(n+1),ra,wa,ea,tt) == SOCKET_ERROR )
    {
+      // Sample the error before leaving the zone - the zone exit can
+      // clobber errno/GetLastError
+      #ifdef NEKO_WINDOWS
+      int err = WSAGetLastError();
       hx::ExitGCFreeZone();
-      HANDLE_EINTR(select_again);
-      hx::Throw( HX_CSTRING("Select error ") + String((int)errno) );
+      #else
+      int err = errno;
+      hx::ExitGCFreeZone();
+      // select_again only exists where POSIX_LABEL defines it (NEKO_POSIX);
+      // elsewhere, emscripten among them, there is no retry to jump to.
+      #ifdef NEKO_POSIX
+      if( err == EINTR )
+         goto select_again;
+      #endif
+      #endif
+      hx::Throw( HX_CSTRING("Select error ") + String(err) );
    }
    hx::ExitGCFreeZone();
 
    Array<Dynamic> r = Array_obj<Dynamic>::__new(3,3);
-   r[0] = make_array_result(rs,ra);
-   r[1] = make_array_result(ws,wa);
-   r[2] = make_array_result(es,ea);
+   r->__unsafe_set(0, make_array_result(rs,ra));
+   r->__unsafe_set(1, make_array_result(ws,wa));
+   r->__unsafe_set(2, make_array_result(es,ea));
    return r;
 }
 
@@ -759,31 +924,46 @@ void _hx_std_socket_fast_select( Array<Dynamic> rs, Array<Dynamic> ws, Array<Dyn
    SOCKET n = 0;
    fd_set rx, wx, ex;
    fd_set *ra, *wa, *ea;
+   double deadline = -1;
 
    POSIX_LABEL(select_again);
    ra = make_socket_array(rs,&rx,&n);
    wa = make_socket_array(ws,&wx,&n);
    ea = make_socket_array(es,&ex,&n);
 
-   if( ra == &INVALID || wa == &INVALID || ea == &INVALID )
-      hx::Throw( HX_CSTRING("No valid sockets") );
-
-
    struct timeval tval;
    struct timeval *tt = 0;
    if( timeout.mPtr )
       tt = init_timeval(timeout,&tval);
+   #ifdef NEKO_POSIX
+   if (tt)
+   {
+      if (deadline < 0)
+         deadline = monotonicSeconds() + tval.tv_sec + tval.tv_usec * 1e-6;
+      else
+         remainingTimeval(deadline, &tval);
+   }
+   #endif
 
    hx::EnterGCFreeZone();
    if( select((int)(n+1),ra,wa,ea,tt) == SOCKET_ERROR )
    {
-      hx::ExitGCFreeZone();
-      HANDLE_EINTR(select_again);
+      // Sample the error before leaving the zone - the zone exit can
+      // clobber errno/GetLastError
       #ifdef NEKO_WINDOWS
-      hx::Throw( HX_CSTRING("Select error ") + String((int)WSAGetLastError()) );
+      int err = WSAGetLastError();
+      hx::ExitGCFreeZone();
       #else
-      hx::Throw( HX_CSTRING("Select error ") + String((int)errno) );
+      int err = errno;
+      hx::ExitGCFreeZone();
+      // select_again only exists where POSIX_LABEL defines it (NEKO_POSIX);
+      // elsewhere, emscripten among them, there is no retry to jump to.
+      #ifdef NEKO_POSIX
+      if( err == EINTR )
+         goto select_again;
       #endif
+      #endif
+      hx::Throw( HX_CSTRING("Select error ") + String(err) );
    }
 
    hx::ExitGCFreeZone();
@@ -791,6 +971,26 @@ void _hx_std_socket_fast_select( Array<Dynamic> rs, Array<Dynamic> ws, Array<Dyn
    make_array_result_inplace(ws, wa);
    make_array_result_inplace(es, ea);
 }
+
+#ifndef NEKO_WINDOWS
+/**
+   SO_REUSEADDR is for a listener taking back a port its predecessor left
+   in TIME_WAIT, and only a stream socket has one. On a datagram socket
+   Linux reads it otherwise: two sockets that both set it may share a port,
+   so binding to port 0 can hand out one already in use -- 18 of 1,000
+   sockets were given one, 306 of 4,000 -- and one of the two then receives
+   the other's datagrams. Any local process that set it could bind a UDP
+   server's port as well.
+**/
+static bool isStreamSocket(SOCKET sock)
+{
+   int type = SOCK_STREAM;
+   SocketLen length = sizeof(type);
+   if (getsockopt(sock,SOL_SOCKET,SO_TYPE,(char*)&type,&length) != 0)
+      return true;
+   return type == SOCK_STREAM;
+}
+#endif
 
 /**
    socket_bind : 'socket -> host : 'int -> port:int -> void
@@ -807,7 +1007,8 @@ void _hx_std_socket_bind( Dynamic o, int host, int port )
    addr.sin_port = htons(port);
    *(int*)&addr.sin_addr.s_addr = host;
    #ifndef NEKO_WINDOWS
-   setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,(char*)&opt,sizeof(opt));
+   if (isStreamSocket(sock))
+      setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,(char*)&opt,sizeof(opt));
    #endif
 
    hx::EnterGCFreeZone();
@@ -836,7 +1037,8 @@ void _hx_std_socket_bind_ipv6( Dynamic o, Array<unsigned char> host, int port )
    addr.sin6_port = htons(port);
    memcpy(&addr.sin6_addr,&host[0], 16);
    #ifndef NEKO_WINDOWS
-   setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,(char*)&opt,sizeof(opt));
+   if (isStreamSocket(sock))
+      setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,(char*)&opt,sizeof(opt));
    #endif
 
    hx::EnterGCFreeZone();
@@ -869,14 +1071,39 @@ Dynamic _hx_std_socket_accept( Dynamic o )
    SockLen addrlen = sizeof(addr);
    SOCKET s;
    hx::EnterGCFreeZone();
+   POSIX_LABEL(accept_again);
+   #if defined(HX_LINUX) && defined(SOCK_CLOEXEC)
+   // Close-on-exec from the start, as in socket_new
+   s = accept4(sock,(struct sockaddr*)&addr,&addrlen,SOCK_CLOEXEC);
+   #else
    s = accept(sock,(struct sockaddr*)&addr,&addrlen);
+   #endif
    if( s == INVALID_SOCKET )
+   {
+      HANDLE_EINTR(accept_again);
       block_error();
+   }
+
+   // macOS copies SO_NOSIGPIPE from the listening socket, but a socket
+   // passed in from elsewhere may not have it
+   #ifdef NEKO_MAC
+      int set = 1;
+      setsockopt(s,SOL_SOCKET,SO_NOSIGPIPE,(void *)&set, sizeof(int));
+   #endif
+   #ifdef NEKO_WINDOWS
+      // An accepted handle is not inheritable only when the listener was
+      // created with WSA_FLAG_NO_HANDLE_INHERIT - not when its flag was
+      // cleared afterwards, as socket_new's fallback does.  An inheritable
+      // one reached every process started while the connection was open,
+      // and the peer saw this process close it only when they all exited
+      SetHandleInformation((HANDLE)s,HANDLE_FLAG_INHERIT,0);
+   #elif defined(NEKO_POSIX) && !(defined(HX_LINUX) && defined(SOCK_CLOEXEC))
+      int old = fcntl(s,F_GETFD,0);
+      if( old >= 0 ) fcntl(s,F_SETFD,old|FD_CLOEXEC);
+   #endif
    hx::ExitGCFreeZone();
 
-   SocketWrapper *wrap = new SocketWrapper();
-   wrap->socket = s;
-   return wrap;
+   return SocketWrapper::create(s);
 }
 
 /**
@@ -933,33 +1160,41 @@ void _hx_std_socket_set_timeout( Dynamic o, Dynamic t )
 {
    SOCKET sock = val_sock(o);
 
+   // null means no timeout (0).  Reject nonsense rather than configuring a
+   // garbage timeout (the old code passed an uninitialized timeval for
+   // negative values), and clamp huge values instead of overflowing
+   double seconds = t.mPtr ? (double)t : 0.0;
+   if( seconds < 0 || seconds != seconds )
+      hx::Throw(HX_CSTRING("Invalid socket timeout"));
+   if( seconds > 0x7fffffff )
+      seconds = 0x7fffffff;
+
 #ifdef NEKO_WINDOWS
    int time;
-   if( !t.mPtr )
+   if( seconds == 0 )
       time = 0;
    else {
-      time = (int)((double)(t) * 1000);
+      double ms = seconds * 1000;
+      time = ms > 0x7fffffff ? 0x7fffffff : (int)ms;
+      // Sub-millisecond must not round to 0 = block forever
+      if( time == 0 )
+         time = 1;
    }
 #else
    struct timeval time;
-   if( t.mPtr==0 ) {
-      time.tv_usec = 0;
-      time.tv_sec = 0;
-   } else {
-      init_timeval(t,&time);
-   }
+   time.tv_usec = (int)( (seconds - (int)seconds) * 1000000 );
+   time.tv_sec = (int)seconds;
+   // Sub-microsecond must not round to 0 = block forever
+   if( seconds > 0 && time.tv_sec == 0 && time.tv_usec == 0 )
+      time.tv_usec = 1;
 #endif
 
    hx::EnterGCFreeZone();
-   if( setsockopt(sock,SOL_SOCKET,SO_SNDTIMEO,(char*)&time,sizeof(time)) != 0 )
+   if( setsockopt(sock,SOL_SOCKET,SO_SNDTIMEO,(char*)&time,sizeof(time)) != 0
+    || setsockopt(sock,SOL_SOCKET,SO_RCVTIMEO,(char*)&time,sizeof(time)) != 0 )
    {
       hx::ExitGCFreeZone();
-      return;
-   }
-   if( setsockopt(sock,SOL_SOCKET,SO_RCVTIMEO,(char*)&time,sizeof(time)) != 0 )
-   {
-      hx::ExitGCFreeZone();
-      return;
+      hx::Throw(HX_CSTRING("Could not set socket timeout"));
    }
    hx::ExitGCFreeZone();
 }
@@ -977,7 +1212,19 @@ void _hx_std_socket_shutdown( Dynamic o, bool r, bool w )
    hx::EnterGCFreeZone();
    if( shutdown(sock,(r)?((w)?SHUT_RDWR:SHUT_RD):SHUT_WR) )
    {
+      // Keep not-connected silent - shutting down defensively before
+      // close is a common pattern.  Real failures should be visible
+      #ifdef NEKO_WINDOWS
+      int err = WSAGetLastError();
       hx::ExitGCFreeZone();
+      if( err != WSAENOTCONN )
+         hx::Throw(HX_CSTRING("Shutdown failed"));
+      #else
+      int err = errno;
+      hx::ExitGCFreeZone();
+      if( err != ENOTCONN )
+         hx::Throw(HX_CSTRING("Shutdown failed"));
+      #endif
       return;
    }
    hx::ExitGCFreeZone();
@@ -999,7 +1246,9 @@ void _hx_std_socket_set_blocking( Dynamic o, bool b )
       if( ioctlsocket(sock,FIONBIO,&arg) != 0 )
       {
          hx::ExitGCFreeZone();
-         return;
+         // Failing silently leaves the socket in the wrong mode and the
+         // caller spinning or blocked with no clue why
+         hx::Throw(HX_CSTRING("Set blocking failed"));
       }
    }
 #else
@@ -1008,7 +1257,7 @@ void _hx_std_socket_set_blocking( Dynamic o, bool b )
       if( rights == -1 )
       {
          hx::ExitGCFreeZone();
-         return;
+         hx::Throw(HX_CSTRING("Set blocking failed"));
       }
       if( b )
          rights &= ~O_NONBLOCK;
@@ -1017,7 +1266,7 @@ void _hx_std_socket_set_blocking( Dynamic o, bool b )
       if( fcntl(sock,F_SETFL,rights) == -1 )
       {
          hx::ExitGCFreeZone();
-         return;
+         hx::Throw(HX_CSTRING("Set blocking failed"));
       }
    }
 #endif
@@ -1221,64 +1470,162 @@ Array<Dynamic> _hx_std_socket_poll_prepare( Dynamic pdata, Array<Dynamic> rsocks
    Update the read/write flags arrays that were created with [socket_poll_prepare].
    </doc>
 **/
-void _hx_std_socket_poll_events( Dynamic pdata, double timeout )
+void _hx_std_socket_poll_events(Dynamic pdata, double timeout)
 {
    polldata *p = val_poll(pdata);
 
-   #ifdef NEKO_WINDOWS
-   memcpy(p->outr,p->fdr,FDSIZE(p->fdr->fd_count));
-   memcpy(p->outw,p->fdw,FDSIZE(p->fdw->fd_count));
+   p->ridx[0] = -1;
+   p->widx[0] = -1;
+
+#ifdef NEKO_WINDOWS
+   memcpy(p->outr, p->fdr, FDSIZE(p->fdr->fd_count));
+   memcpy(p->outw, p->fdw, FDSIZE(p->fdw->fd_count));
+
+   // The exception set takes the first FD_SETSIZE read sockets, as FD_SET
+   // filled it - copied, since FD_SET searches the set for a duplicate on
+   // every add and the sockets here are distinct already.
+   fd_set oute;
+   FD_ZERO(&oute);
+   {
+      u_int count = p->fdr->fd_count < FD_SETSIZE ? p->fdr->fd_count : FD_SETSIZE;
+      for (u_int i = 0; i < count; ++i)
+         oute.fd_array[i] = p->fdr->fd_array[i];
+      oute.fd_count = count;
+   }
 
    struct timeval t;
-   struct timeval *tt = init_timeval(timeout,&t);
+   struct timeval *tt = init_timeval(timeout, &t);
 
    hx::EnterGCFreeZone();
-   if( select(0/* Ignored */, p->fdr->fd_count ? p->outr : 0, p->fdw->fd_count ?p->outw : 0,NULL,tt) == SOCKET_ERROR )
+   int sel = select(
+       0,
+       p->fdr->fd_count ? p->outr : 0,
+       p->fdw->fd_count ? p->outw : 0,
+       p->fdr->fd_count ? &oute : 0,
+       tt);
+   if (sel == SOCKET_ERROR)
    {
       hx::ExitGCFreeZone();
+
+      int k = 0;
+      for (u_int i = 0; i < p->fdr->fd_count; ++i)
+         p->ridx[k++] = i;
+      p->ridx[k] = -1;
+
       return;
    }
    hx::ExitGCFreeZone();
 
+   // Which of the sockets asked about are ready. select leaves each set
+   // holding only its ready sockets, in the order they were given, so one
+   // walk of the registered sockets alongside them finds every one: linear
+   // in the sockets registered plus those ready. FD_ISSET, asked for each
+   // registered socket, searched the ready set from its start every time -
+   // registered x ready comparisons, 1.9 ms a pass at 4,096 sockets with
+   // half of them ready. Should a set come back in another order the walk
+   // misses some, and that pass is decided by FD_ISSET as it always was.
    int k = 0;
-   for(int i=0;i<p->fdr->fd_count;i++)
-      if( FD_ISSET(p->fdr->fd_array[i],p->outr) )
-         p->ridx[k++] = i;
+   {
+      fd_set *ready = p->outr;
+      u_int r = 0, e = 0;
+      for (u_int i = 0; i < p->fdr->fd_count; ++i)
+      {
+         SOCKET fd = p->fdr->fd_array[i];
+         bool hit = false;
+         if (r < ready->fd_count && ready->fd_array[r] == fd)
+         {
+            hit = true;
+            r++;
+         }
+         if (e < oute.fd_count && oute.fd_array[e] == fd)
+         {
+            hit = true;
+            e++;
+         }
+         if (hit)
+            p->ridx[k++] = i;
+      }
+      if (r != ready->fd_count || e != oute.fd_count)
+      {
+         k = 0;
+         for (u_int i = 0; i < p->fdr->fd_count; ++i)
+         {
+            SOCKET fd = p->fdr->fd_array[i];
+            if (FD_ISSET(fd, p->outr) || FD_ISSET(fd, &oute))
+               p->ridx[k++] = i;
+         }
+      }
+   }
    p->ridx[k] = -1;
 
    k = 0;
-   for(int i=0;i<p->fdw->fd_count;i++)
-      if( FD_ISSET(p->fdw->fd_array[i],p->outw) )
-         p->widx[k++] = i;
+   {
+      fd_set *ready = p->outw;
+      u_int w = 0;
+      for (u_int i = 0; i < p->fdw->fd_count; ++i)
+      {
+         if (w < ready->fd_count && ready->fd_array[w] == p->fdw->fd_array[i])
+         {
+            p->widx[k++] = i;
+            w++;
+         }
+      }
+      if (w != ready->fd_count)
+      {
+         k = 0;
+         for (u_int i = 0; i < p->fdw->fd_count; ++i)
+         {
+            if (FD_ISSET(p->fdw->fd_array[i], p->outw))
+               p->widx[k++] = i;
+         }
+      }
+   }
    p->widx[k] = -1;
 
-   #else
-
+#else
    int tot = p->rcount + p->wcount;
+
+   int waitMs = (int)(timeout * 1000);
+   double deadline = monotonicSeconds() + timeout;
    hx::EnterGCFreeZone();
-   POSIX_LABEL(poll_events_again);
-   if( poll(p->fds,tot,(int)(timeout * 1000)) < 0 )
+poll_events_again:
+   if (poll(p->fds, tot, waitMs) < 0)
    {
-      HANDLE_EINTR(poll_events_again);
+      if (errno == EINTR)
+      {
+         if (timeout >= 0)
+         {
+            double left = deadline - monotonicSeconds();
+            waitMs = left > 0 ? (int)(left * 1000) + 1 : 0;
+         }
+         goto poll_events_again;
+      }
       hx::ExitGCFreeZone();
+
       return;
    }
    hx::ExitGCFreeZone();
 
    int k = 0;
    int i = 0;
-   for(i=0;i<p->rcount;i++)
-      if( p->fds[i].revents & (POLLIN|POLLHUP) )
-         p->ridx[k++] = i;
-   p->ridx[k] = -1;
-   k = 0;
-   for(;i<tot;i++)
-      if( p->fds[i].revents & (POLLOUT|POLLHUP) )
-         p->widx[k++] = i - p->rcount;
-   p->widx[k] = -1;
-   #endif
-}
 
+   for (i = 0; i < p->rcount; ++i)
+   {
+      if (p->fds[i].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))
+         p->ridx[k++] = i;
+   }
+   p->ridx[k] = -1;
+
+   k = 0;
+
+   for (; i < tot; ++i)
+   {
+      if (p->fds[i].revents & (POLLOUT | POLLHUP | POLLERR | POLLNVAL))
+         p->widx[k++] = i - p->rcount;
+   }
+   p->widx[k] = -1;
+#endif
+}
 
 /**
    socket_poll : 'socket array -> 'poll -> timeout:float -> 'socket array
@@ -1317,9 +1664,8 @@ int _hx_std_socket_send_to( Dynamic o, Array<unsigned char> buf, int p, int l, D
 {
    SOCKET sock = val_sock(o);
 
-   const char *cdata = (const char *)&buf[0];
    int dlen = buf->length;
-   if( p < 0 || l < 0 || p > dlen || p + l > dlen )
+   if( p < 0 || l < 0 || p > dlen || l > dlen - p )
       hx::Throw(HX_CSTRING("Invalid data position"));
 
 
@@ -1331,6 +1677,9 @@ int _hx_std_socket_send_to( Dynamic o, Array<unsigned char> buf, int p, int l, D
    addr.sin_port = htons(port);
    *(int*)&addr.sin_addr.s_addr = host;
 
+   // Capture after the field lookups above (which can allocate and move
+   // buf); volatile keeps the allocation start in the scanned frame
+   const char * volatile cdata = (const char *)buf->GetBase();
 
    hx::EnterGCFreeZone();
    POSIX_LABEL(send_again);
@@ -1355,12 +1704,16 @@ int _hx_std_socket_recv_from( Dynamic o, Array<unsigned char> buf, int p, int l,
    int retry = 0;
    SOCKET sock = val_sock(o);
 
-   char *data = (char *)&buf[0];
    int dlen = buf->length;
-   if( p < 0 || l < 0 || p > dlen || p + l > dlen )
+   if( p < 0 || l < 0 || p > dlen || l > dlen - p )
       hx::Throw(HX_CSTRING("Invalid data position"));
 
+   char * volatile data = (char *)buf->GetBase();
+
+   // Zeroed so the plain-recv retry fallback below reports 0.0.0.0:0
+   // instead of uninitialized stack memory
    struct sockaddr_in saddr;
+   memset(&saddr,0,sizeof(saddr));
    SockLen slen = sizeof(saddr);
 
    int ret = 0;
@@ -1371,8 +1724,18 @@ int _hx_std_socket_recv_from( Dynamic o, Array<unsigned char> buf, int p, int l,
    } else
       ret = recvfrom(sock, data + p , l, MSG_NOSIGNAL, (struct sockaddr*)&saddr, &slen);
    if( ret == SOCKET_ERROR ) {
-      HANDLE_EINTR(recv_from_again);
-      block_error();
+      #ifdef NEKO_WINDOWS
+      // Datagram larger than the buffer: the buffer and address are
+      // filled, Winsock just insists on reporting the truncation.
+      // posix truncates silently - match posix
+      if( WSAGetLastError() == WSAEMSGSIZE )
+         ret = l;
+      else
+      #endif
+      {
+         HANDLE_EINTR(recv_from_again);
+         block_error();
+      }
    }
 
    hx::ExitGCFreeZone();

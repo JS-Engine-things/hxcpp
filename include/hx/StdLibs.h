@@ -18,6 +18,7 @@ Resource *GetResources();
 
 HXCPP_EXTERN_CLASS_ATTRIBUTES
 void RegisterResources(hx::Resource *inResources);
+void UnregisterResources(hx::Resource *inResources);
 
 
 struct AnyCast
@@ -80,6 +81,7 @@ HXCPP_EXTERN_CLASS_ATTRIBUTES int hxcpp_alloc_kind();
 
 // --- Maths ---------------------------------------------------------
 double __hxcpp_drand();
+HXCPP_EXTERN_CLASS_ATTRIBUTES double _hx_strtod_c_locale(const char *inStr);
 HXCPP_EXTERN_CLASS_ATTRIBUTES int __hxcpp_irand(int inMax);
 
 // --- Casting/Converting ---------------------------------------------------------
@@ -592,86 +594,31 @@ void __hxcpp_stop_profiler();
 
 // --- Memory --------------------------------------------------------------------------
 
+// Reads and writes values at any byte offset. A cast pointer would be
+// undefined there, and traps on targets without unaligned access; memcpy
+// compiles to a single load or store wherever the target allows it.
+template<typename T>
+inline T __hxcpp_memory_load(const unsigned char *inPtr)
+{
+   T result;
+   ::memcpy(&result, inPtr, sizeof(T));
+   return result;
+}
+
+template<typename T>
+inline void __hxcpp_memory_store(unsigned char *inPtr, T inValue)
+{
+   ::memcpy(inPtr, &inValue, sizeof(T));
+}
+
 inline void __hxcpp_align_set_float32( unsigned char *base, int addr, float v)
-{
-   #ifdef HXCPP_ALIGN_FLOAT
-   if (addr & 3)
-   {
-      const unsigned char *src = (const unsigned char *)&v;
-      unsigned char *dest = base + addr;
-      dest[0] = src[0];
-      dest[1] = src[1];
-      dest[2] = src[2];
-      dest[3] = src[3];
-   }
-   else
-   #endif
-   *(float *)(base+addr) = v;
-}
-
-
+   { __hxcpp_memory_store<float>(base+addr, v); }
 inline float __hxcpp_align_get_float32( unsigned char *base, int addr)
-{
-   #ifdef HXCPP_ALIGN_FLOAT
-   if (addr & 3)
-   {
-      float buf;
-      unsigned char *dest = (unsigned char *)&buf;
-      const unsigned char *src = base + addr;
-      dest[0] = src[0];
-      dest[1] = src[1];
-      dest[2] = src[2];
-      dest[3] = src[3];
-      return buf;
-   }
-   #endif
-   return *(float *)(base+addr);
-}
-
-
+   { return __hxcpp_memory_load<float>(base+addr); }
 inline void __hxcpp_align_set_float64( unsigned char *base, int addr, double v)
-{
-   #ifdef HXCPP_ALIGN_FLOAT
-   if (addr & 3)
-   {
-      unsigned char *dest = base + addr;
-      const unsigned char *src = (const unsigned char *)&v;
-      dest[0] = src[0];
-      dest[1] = src[1];
-      dest[2] = src[2];
-      dest[3] = src[3];
-      dest[4] = src[4];
-      dest[5] = src[5];
-      dest[6] = src[6];
-      dest[7] = src[7];
-   }
-   else
-   #endif
-   *(double *)(base + addr) = v;
-}
-
-
+   { __hxcpp_memory_store<double>(base+addr, v); }
 inline double __hxcpp_align_get_float64( unsigned char *base, int addr)
-{
-   #ifdef HXCPP_ALIGN_FLOAT
-   if (addr & 3)
-   {
-      double buf;
-      unsigned char *dest = (unsigned char *)&buf;
-      const unsigned char *src = base + addr;
-      dest[0] = src[0];
-      dest[1] = src[1];
-      dest[2] = src[2];
-      dest[3] = src[3];
-      dest[4] = src[4];
-      dest[5] = src[5];
-      dest[6] = src[6];
-      dest[7] = src[7];
-      return buf;
-   }
-   #endif
-   return *(double *)(base+addr);
-}
+   { return __hxcpp_memory_load<double>(base+addr); }
 
 
 
@@ -686,10 +633,10 @@ inline double __hxcpp_memory_get_double(Array<unsigned char> inBuffer ,int addr)
 inline float __hxcpp_memory_get_float(Array<unsigned char> inBuffer ,int addr) {
    return __hxcpp_align_get_float32((unsigned char *)inBuffer->GetBase(), addr);
 }
-inline int __hxcpp_memory_get_i16(Array<unsigned char> inBuffer ,int addr) { return *(short *)(inBuffer->GetBase()+addr); }
-inline int __hxcpp_memory_get_i32(Array<unsigned char> inBuffer ,int addr) { return *(int *)(inBuffer->GetBase()+addr); }
-inline int __hxcpp_memory_get_ui16(Array<unsigned char> inBuffer ,int addr) { return *(unsigned short *)(inBuffer->GetBase()+addr); }
-inline int __hxcpp_memory_get_ui32(Array<unsigned char> inBuffer ,int addr) { return *(unsigned int *)(inBuffer->GetBase()+addr); }
+inline int __hxcpp_memory_get_i16(Array<unsigned char> inBuffer ,int addr) { return __hxcpp_memory_load<short>((unsigned char *)inBuffer->GetBase()+addr); }
+inline int __hxcpp_memory_get_i32(Array<unsigned char> inBuffer ,int addr) { return __hxcpp_memory_load<int>((unsigned char *)inBuffer->GetBase()+addr); }
+inline int __hxcpp_memory_get_ui16(Array<unsigned char> inBuffer ,int addr) { return __hxcpp_memory_load<unsigned short>((unsigned char *)inBuffer->GetBase()+addr); }
+inline int __hxcpp_memory_get_ui32(Array<unsigned char> inBuffer ,int addr) { return __hxcpp_memory_load<unsigned int>((unsigned char *)inBuffer->GetBase()+addr); }
 inline float __hxcpp_memory_get_f32(Array<unsigned char> inBuffer ,int addr) {
    return __hxcpp_align_get_float32((unsigned char *)inBuffer->GetBase(), addr);
 }
@@ -701,10 +648,10 @@ inline void __hxcpp_memory_set_double(Array<unsigned char> inBuffer ,int addr,do
 inline void __hxcpp_memory_set_float(Array<unsigned char> inBuffer ,int addr,float v) {
    return __hxcpp_align_set_float32((unsigned char *)inBuffer->GetBase(), addr,v);
 }
-inline void __hxcpp_memory_set_i16(Array<unsigned char> inBuffer ,int addr,int v) { *(short *)(inBuffer->GetBase()+addr) = v; }
-inline void __hxcpp_memory_set_i32(Array<unsigned char> inBuffer ,int addr,int v) { *(int *)(inBuffer->GetBase()+addr) = v; }
-inline void __hxcpp_memory_set_ui16(Array<unsigned char> inBuffer ,int addr,int v) { *(unsigned short *)(inBuffer->GetBase()+addr) = v; }
-inline void __hxcpp_memory_set_ui32(Array<unsigned char> inBuffer ,int addr,int v) { *(unsigned int *)(inBuffer->GetBase()+addr) = v; }
+inline void __hxcpp_memory_set_i16(Array<unsigned char> inBuffer ,int addr,int v) { __hxcpp_memory_store<short>((unsigned char *)inBuffer->GetBase()+addr, (short)v); }
+inline void __hxcpp_memory_set_i32(Array<unsigned char> inBuffer ,int addr,int v) { __hxcpp_memory_store<int>((unsigned char *)inBuffer->GetBase()+addr, v); }
+inline void __hxcpp_memory_set_ui16(Array<unsigned char> inBuffer ,int addr,int v) { __hxcpp_memory_store<unsigned short>((unsigned char *)inBuffer->GetBase()+addr, (unsigned short)v); }
+inline void __hxcpp_memory_set_ui32(Array<unsigned char> inBuffer ,int addr,int v) { __hxcpp_memory_store<unsigned int>((unsigned char *)inBuffer->GetBase()+addr, (unsigned int)v); }
 inline void __hxcpp_memory_set_f32(Array<unsigned char> inBuffer ,int addr,float v) {
    return __hxcpp_align_set_float32((unsigned char *)inBuffer->GetBase(), addr, v);
 }
@@ -720,19 +667,19 @@ inline void __hxcpp_memory_select( Array<unsigned char> inBuffer )
 inline int __hxcpp_memory_get_byte(int addr) { return __hxcpp_memory[addr]; }
 inline double __hxcpp_memory_get_double(int addr) { return __hxcpp_align_get_float64(__hxcpp_memory,addr); }
 inline float __hxcpp_memory_get_float(int addr) { return __hxcpp_align_get_float32(__hxcpp_memory,addr); }
-inline int __hxcpp_memory_get_i16(int addr) { return *(short *)(__hxcpp_memory+addr); }
-inline int __hxcpp_memory_get_i32(int addr) { return *(int *)(__hxcpp_memory+addr); }
-inline int __hxcpp_memory_get_ui16(int addr) { return *(unsigned short *)(__hxcpp_memory+addr); }
-inline int __hxcpp_memory_get_ui32(int addr) { return *(unsigned int *)(__hxcpp_memory+addr); }
+inline int __hxcpp_memory_get_i16(int addr) { return __hxcpp_memory_load<short>(__hxcpp_memory+addr); }
+inline int __hxcpp_memory_get_i32(int addr) { return __hxcpp_memory_load<int>(__hxcpp_memory+addr); }
+inline int __hxcpp_memory_get_ui16(int addr) { return __hxcpp_memory_load<unsigned short>(__hxcpp_memory+addr); }
+inline int __hxcpp_memory_get_ui32(int addr) { return __hxcpp_memory_load<unsigned int>(__hxcpp_memory+addr); }
 inline float __hxcpp_memory_get_f32(int addr) { return __hxcpp_align_get_float32(__hxcpp_memory,addr); }
 
 inline void __hxcpp_memory_set_byte(int addr,int v) { __hxcpp_memory[addr] = v; }
 inline void __hxcpp_memory_set_double(int addr,double v) { __hxcpp_align_set_float64(__hxcpp_memory,addr,v); }
 inline void __hxcpp_memory_set_float(int addr,float v) { __hxcpp_align_set_float32(__hxcpp_memory,addr,v); }
-inline void __hxcpp_memory_set_i16(int addr,int v) { *(short *)(__hxcpp_memory+addr) = v; }
-inline void __hxcpp_memory_set_i32(int addr,int v) { *(int *)(__hxcpp_memory+addr) = v; }
-inline void __hxcpp_memory_set_ui16(int addr,int v) { *(unsigned short *)(__hxcpp_memory+addr) = v; }
-inline void __hxcpp_memory_set_ui32(int addr,int v) { *(unsigned int *)(__hxcpp_memory+addr) = v; }
+inline void __hxcpp_memory_set_i16(int addr,int v) { __hxcpp_memory_store<short>(__hxcpp_memory+addr, (short)v); }
+inline void __hxcpp_memory_set_i32(int addr,int v) { __hxcpp_memory_store<int>(__hxcpp_memory+addr, v); }
+inline void __hxcpp_memory_set_ui16(int addr,int v) { __hxcpp_memory_store<unsigned short>(__hxcpp_memory+addr, (unsigned short)v); }
+inline void __hxcpp_memory_set_ui32(int addr,int v) { __hxcpp_memory_store<unsigned int>(__hxcpp_memory+addr, (unsigned int)v); }
 inline void __hxcpp_memory_set_f32(int addr,float v) { __hxcpp_align_set_float32(__hxcpp_memory,addr,v); }
 
 // FPHelper conversion
@@ -751,16 +698,17 @@ inline float __hxcpp_reinterpret_le_int32_as_float32(int inInt)
    #ifdef HXCPP_BIG_ENDIAN
    __hxcpp_reverse_endian(inInt);
    #endif
-   return *(float*)(&inInt);
+   return __hxcpp_memory_load<float>((const unsigned char *)&inInt);
 }
 
 
 inline int __hxcpp_reinterpret_float32_as_le_int32(float inFloat)
 {
+   int bits = __hxcpp_memory_load<int>((const unsigned char *)&inFloat);
    #ifdef HXCPP_BIG_ENDIAN
-   __hxcpp_reverse_endian(*(int *)&inFloat);
+   __hxcpp_reverse_endian(bits);
    #endif
-   return *(int*)(&inFloat);
+   return bits;
 }
 
 
@@ -771,13 +719,14 @@ inline double __hxcpp_reinterpret_le_int32s_as_float64(int inLow, int inHigh)
    __hxcpp_reverse_endian(vals[0]);
    __hxcpp_reverse_endian(vals[1]);
    #endif
-   return *(double*)(vals);
+   return __hxcpp_memory_load<double>((const unsigned char *)vals);
 }
 
 
 inline int __hxcpp_reinterpret_float64_as_le_int32_low(double inValue)
 {
-   int *asInts = (int *)&inValue;
+   int asInts[2];
+   ::memcpy(asInts, &inValue, sizeof(asInts));
    #ifdef HXCPP_BIG_ENDIAN
    __hxcpp_reverse_endian(asInts[0]);
    #endif
@@ -787,7 +736,8 @@ inline int __hxcpp_reinterpret_float64_as_le_int32_low(double inValue)
 
 inline int __hxcpp_reinterpret_float64_as_le_int32_high(double inValue)
 {
-   int *asInts = (int *)&inValue;
+   int asInts[2];
+   ::memcpy(asInts, &inValue, sizeof(asInts));
    #ifdef HXCPP_BIG_ENDIAN
    __hxcpp_reverse_endian(asInts[1]);
    #endif
@@ -839,7 +789,7 @@ HXCPP_EXTERN_CLASS_ATTRIBUTES void _hx_inflate_end(Dynamic handle);
 
 HXCPP_EXTERN_CLASS_ATTRIBUTES void _hx_zip_set_flush_mode(Dynamic handle, String flushMode);
 
-// sys.db.Mysql.hx -> src/hx/libs/regexp/RegExp.cpp
+// sys.db.Mysql.hx -> src/hx/libs/mysql/Mysql.cpp
 HXCPP_EXTERN_CLASS_ATTRIBUTES Dynamic _hx_mysql_connect(Dynamic params);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void    _hx_mysql_select_db(Dynamic handle,String db);
 HXCPP_EXTERN_CLASS_ATTRIBUTES Dynamic _hx_mysql_request(Dynamic handle,String req);
@@ -853,18 +803,34 @@ HXCPP_EXTERN_CLASS_ATTRIBUTES int     _hx_mysql_result_get_int(Dynamic handle,in
 HXCPP_EXTERN_CLASS_ATTRIBUTES Float   _hx_mysql_result_get_float(Dynamic handle,int i);
 HXCPP_EXTERN_CLASS_ATTRIBUTES Array<String> _hx_mysql_result_get_fields_names(Dynamic handle);
 
+HXCPP_EXTERN_CLASS_ATTRIBUTES Dynamic _hx_mysql_create(Dynamic params);
+HXCPP_EXTERN_CLASS_ATTRIBUTES void    _hx_mysql_open(Dynamic handle);
+HXCPP_EXTERN_CLASS_ATTRIBUTES Dynamic _hx_mysql_request_stream(Dynamic handle,String req);
+HXCPP_EXTERN_CLASS_ATTRIBUTES Dynamic _hx_mysql_insert_id(Dynamic handle);
+HXCPP_EXTERN_CLASS_ATTRIBUTES Dynamic _hx_mysql_affected_rows(Dynamic handle);
+HXCPP_EXTERN_CLASS_ATTRIBUTES String  _hx_mysql_server_version(Dynamic handle);
+HXCPP_EXTERN_CLASS_ATTRIBUTES int     _hx_mysql_server_status(Dynamic handle);
+HXCPP_EXTERN_CLASS_ATTRIBUTES bool    _hx_mysql_ping(Dynamic handle);
+HXCPP_EXTERN_CLASS_ATTRIBUTES int     _hx_mysql_errno(Dynamic handle);
+HXCPP_EXTERN_CLASS_ATTRIBUTES String  _hx_mysql_sqlstate(Dynamic handle);
+HXCPP_EXTERN_CLASS_ATTRIBUTES Float   _hx_mysql_thread_id(Dynamic handle);
+HXCPP_EXTERN_CLASS_ATTRIBUTES bool    _hx_mysql_is_tls(Dynamic handle);
+HXCPP_EXTERN_CLASS_ATTRIBUTES Array<int> _hx_mysql_keepalive(Dynamic handle);
+HXCPP_EXTERN_CLASS_ATTRIBUTES String  _hx_mysql_auth_plugin(Dynamic handle);
+
 namespace cpp { template<typename T> class Function; }
 
 HXCPP_EXTERN_CLASS_ATTRIBUTES void _hx_mysql_set_conversion(
       cpp::Function< Dynamic(Dynamic) > inCharsToBytes,
       cpp::Function< Dynamic(Float) > inTimeToDate );
 
-// sys.db.Sqlite.hx -> src/hx/libs/sqlite/RegExp.cpp
+// sys.db.Sqlite.hx -> src/hx/libs/sqlite/Sqlite.cpp
 
 HXCPP_EXTERN_CLASS_ATTRIBUTES Dynamic _hx_sqlite_connect(String filename);
 HXCPP_EXTERN_CLASS_ATTRIBUTES Dynamic _hx_sqlite_request(Dynamic handle,String req);
 HXCPP_EXTERN_CLASS_ATTRIBUTES void    _hx_sqlite_close(Dynamic handle);
 HXCPP_EXTERN_CLASS_ATTRIBUTES int     _hx_sqlite_last_insert_id(Dynamic handle);
+HXCPP_EXTERN_CLASS_ATTRIBUTES bool    _hx_sqlite_get_autocommit(Dynamic handle);
 
 HXCPP_EXTERN_CLASS_ATTRIBUTES int     _hx_sqlite_result_get_length(Dynamic handle);
 HXCPP_EXTERN_CLASS_ATTRIBUTES int     _hx_sqlite_result_get_nfields(Dynamic handle);
@@ -905,6 +871,7 @@ HXCPP_EXTERN_CLASS_ATTRIBUTES int _hx_std_process_exit( Dynamic handle );
 HXCPP_EXTERN_CLASS_ATTRIBUTES int _hx_std_process_pid( Dynamic handle );
 HXCPP_EXTERN_CLASS_ATTRIBUTES void _hx_std_process_kill( Dynamic handle );
 HXCPP_EXTERN_CLASS_ATTRIBUTES void _hx_std_process_close( Dynamic handle );
+HXCPP_EXTERN_CLASS_ATTRIBUTES Dynamic _hx_std_process_communicate( Dynamic handle, Array<unsigned char> input, Float timeout, int maxOutput );
 
 // Random
 HXCPP_EXTERN_CLASS_ATTRIBUTES Dynamic _hx_std_random_new();

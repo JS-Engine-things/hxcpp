@@ -159,25 +159,14 @@ public:
 
    inline void *operator new( size_t inSize, bool inContainer=true, const char *inName=0 )
    {
-      #ifdef HX_USE_INLINE_IMMIX_OPERATOR_NEW
-         ImmixAllocator *alloc =  HX_CTX_GET;
+      ImmixAllocator *alloc =  HX_CTX_GET;
 
-         #ifdef HXCPP_DEBUG
-         if (!alloc)
-            BadImmixAlloc();
-         #endif
-
-         return ImmixAllocator::alloc(alloc, inSize, inContainer, inName);
-
-      #else // Not HX_USE_INLINE_IMMIX_OPERATOR_NEW ...
-
-         void *result = hx::InternalNew(inSize,inContainer);
-
-         #ifdef HXCPP_TELEMETRY
-            __hxt_gc_new(result, inSize, inName);
-         #endif
-         return result;
+      #ifdef HXCPP_DEBUG
+      if (!alloc)
+         BadImmixAlloc();
       #endif
+
+      return ImmixAllocator::alloc(alloc, inSize, inContainer, inName);
    }
 
    inline void *operator new( size_t inSize, hx::NewObjectType inType,  const char *inName=0 )
@@ -387,8 +376,10 @@ public:
       return mPtr->__compare(inRHS.mPtr);
    }
 
+   // Through Native's constructor from an ObjectPtr, which registers the
+   // offset of a @:nativeGen interface inside the object with the collector
    template<typename T>
-   operator hx::Native<T> () { return hx::Native<T>( mPtr ); }
+   operator hx::Native<T> () { return hx::Native<T>( *this ); }
 
    inline bool operator==(const null &inRHS) const { return mPtr==0; }
    inline bool operator!=(const null &inRHS) const { return mPtr!=0; }

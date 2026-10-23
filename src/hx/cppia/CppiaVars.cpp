@@ -7,12 +7,12 @@ namespace hx
 
 static int sTypeSize[] = { 0, 0, sizeof(hx::Object *), sizeof(String), sizeof(Float), sizeof(int) };
 
-inline void AlignOffset(ExprType type, int &ioOffset)
+void AlignOffset(ExprType type, int &ioOffset)
 {
-   #ifdef HXCPP_ALIGN_FLOAT
-   if (type==etFloat && (ioOffset & 0x7) )
-      ioOffset = (ioOffset + 7) & ~7;
-   #endif
+   int align = type==etInt ? (int)alignof(int) :
+               type==etFloat ? (int)alignof(Float) :
+               type==etString ? (int)alignof(String) : (int)alignof(hx::Object *);
+   ioOffset = (ioOffset + align - 1) & ~(align - 1);
 }
 
 
@@ -61,7 +61,6 @@ void CppiaVar::clear()
    typeId = 0;
    offset = 0;
    type = 0;
-   owner = 0;
    objVal.mPtr = 0;
    intVal = 0;
    stringVal = String();
@@ -77,8 +76,8 @@ void CppiaVar::load(CppiaStream &stream)
    readAccess = getAccess(stream);
    writeAccess = getAccess(stream);
    isVirtual = stream.getBool();
-   nameId = stream.getInt();
-   typeId = stream.getInt();
+   nameId = stream.getStringId();
+   typeId = stream.getTypeId();
    if (stream.getInt())
       init = createCppiaExpr(stream);
 }
@@ -87,10 +86,6 @@ void CppiaVar::load(CppiaStream &stream)
 // Static...
 void CppiaVar::linkVarTypes(CppiaModule &cppia)
 {
-   if (owner && owner!=&cppia)
-      return;
-   owner = &cppia;
-
    if (dynamicFunction)
    {
       nameId = dynamicFunction->nameId;
@@ -113,7 +108,7 @@ void CppiaVar::linkVarTypes(CppiaModule &cppia)
          case fsObject: valPointer = &objVal; break;
          default:
             valPointer = 0;
-            throw cppiaError("Variable %s has an unknown storage type %d", cppia.strings[nameId].out_str(), (int)storeType);
+            throw "Unkown store type";
       }
    }
 }
@@ -165,7 +160,7 @@ CppiaExpr *CppiaVar::createAccess(CppiaExpr *inSrc)
    if (valPointer)
       return createStaticAccess(inSrc, storeType, valPointer);
    if (isVirtual)
-      throw cppiaExprError(inSrc, "Extern field %s can not be accessed directly", name.out_str());
+      throw "Direct access to extern field";
    //throw "Unlinked static variable";
    return 0;
 }
@@ -173,11 +168,6 @@ CppiaExpr *CppiaVar::createAccess(CppiaExpr *inSrc)
 void CppiaVar::linkVarTypes(CppiaModule &cppia, int &ioOffset)
 {
    DBGLOG("linkVarTypes %p\n",dynamicFunction);
-   if (owner && owner!=&cppia)
-      return;
-   owner = &cppia;
-   name = cppia.strings[dynamicFunction ? dynamicFunction->nameId : nameId];
-
    if (dynamicFunction)
    {
       //dynamicFunction->linkTypes(cppia);
@@ -190,23 +180,17 @@ void CppiaVar::linkVarTypes(CppiaModule &cppia, int &ioOffset)
       AlignOffset(exprType, ioOffset);
       offset = ioOffset;
       
-      switch(exprType)
-      {
-         case etInt: ioOffset += sizeof(int); storeType=fsInt; break;
-         case etFloat: ioOffset += sizeof(Float);storeType=fsFloat;  break;
-         case etString: ioOffset += sizeof(String);storeType=fsString;  break;
-         case etObject: ioOffset += sizeof(hx::Object *);storeType=fsObject;  break;
-         case etVoid:
-         case etNull:
-            break;
-      }
+      storeType = typeId==0 ? fsObject : fieldStorageFromType(type);
+
+      ioOffset += sTypeSize[exprType];
    }
 }
 
 void CppiaVar::createDynamic(hx::Object *inBase)
 {
-   *(hx::Object **)((char *)inBase+offset) = createMemberClosure(inBase,(ScriptCallable*)dynamicFunction->funExpr);
-   HX_OBJ_WB_GET(inBase, *(hx::Object **)((char *)inBase+offset));
+   hx::Object **slot = (hx::Object **)((char *)inBase+offset);
+   *slot = createMemberClosure(inBase,(ScriptCallable*)dynamicFunction->funExpr);
+   HX_OBJ_WB_GET(inBase, *slot);
 }
 
 
@@ -240,7 +224,9 @@ Dynamic CppiaVar::setValue(hx::Object *inThis, Dynamic inValue)
       case fsFloat: *(Float *)(base) = inValue; return inValue;
       case fsString:
          *(String *)(base) = inValue;
-         HX_OBJ_WB_GET(inThis, (void *)((String *)(base))->raw_ptr());
+         #ifdef HXCPP_GC_GENERATIONAL
+         HX_OBJ_WB_GET(inThis, hx::PointerOf(*(String *)(base)));
+         #endif
          return inValue;
       case fsObject:
             switch(type->arrayType)
@@ -273,7 +259,10 @@ Dynamic CppiaVar::setValue(hx::Object *inThis, Dynamic inValue)
                   *(Array<Dynamic> *)(base) = inValue;
                   break;
             }
+            // Every case above stores one object pointer at base.
+            #ifdef HXCPP_GC_GENERATIONAL
             HX_OBJ_WB_GET(inThis, *(hx::Object **)(base));
+            #endif
             return inValue;
       case fsUnknown:
          break;
@@ -284,10 +273,6 @@ Dynamic CppiaVar::setValue(hx::Object *inThis, Dynamic inValue)
 
 void CppiaVar::link(CppiaModule &inModule)
 {
-   // Inherited from a class of another module.
-   if (owner && owner!=&inModule)
-      return;
-
    if (dynamicFunction)
       dynamicFunction->link();
    type = inModule.types[typeId];
@@ -302,7 +287,7 @@ CppiaVar::Access CppiaVar::getAccess(CppiaStream &stream)
 {
    std::string tok = stream.getToken();
    if (tok.size()!=1)
-      throw cppiaError("Expected a one letter variable access code (N, n, R, C or V) but found '%.32s'", tok.c_str());
+      throw "bad var access length";
    switch(tok[0])
    {
       case 'N': return accNormal;
@@ -311,7 +296,7 @@ CppiaVar::Access CppiaVar::getAccess(CppiaStream &stream)
       case 'C': return accCall;
       case 'V': return accCallNative;
    }
-   throw cppiaError("Unknown variable access code '%c', expected N, n, R, C or V", tok[0]);
+   throw "bad access code";
    return accNormal;
 }
 
@@ -404,10 +389,10 @@ CppiaStackVar::CppiaStackVar(CppiaStackVar *inVar,int &ioSize, int &ioCaptureSiz
 
 void CppiaStackVar::fromStream(CppiaStream &stream)
 {
-   nameId = stream.getInt();
+   nameId = stream.getStringId();
    id = stream.getInt();
    capture = stream.getBool();
-   typeId = stream.getInt();
+   typeId = stream.getTypeId();
 }
 
 void CppiaStackVar::setInFrame(unsigned char *inFrame,Dynamic inValue)

@@ -75,7 +75,6 @@ class BuildTool
    var defaultObjCxxStandard:Null<Int>;
 
    public static var os="";
-   public static var sAllowNumProcs = true;
    public static var sCompileThreadCount = 1;
    public static var sThreadPool:ThreadPool;
    public static var sReportedThreads = -1;
@@ -84,6 +83,8 @@ class BuildTool
    public static var isWindows = false;
    public static var isWindowsArm = false;
    public static var isLinux = false;
+   public static var isBSD = false;
+   public static var isRPi = false;
    public static var isMac = false;
    public static var targetKey:String;
    public static var instance:BuildTool;
@@ -203,8 +204,8 @@ class BuildTool
       if (isMsvc())
       {
          mDefines.set("isMsvc","1");
-         if (Std.parseInt(mDefines.get("MSVC_VER"))>=18)
-            mDefines.set("MSVC18+","1");
+         // deprecated
+         mDefines.set("MSVC18+","1");
       }
 
       include("toolchain/finish-setup.xml", false);
@@ -367,19 +368,16 @@ class BuildTool
       if (instance!=null)
       {
          var defs = instance.mDefines;
-         if (sAllowNumProcs)
-         {
-            var thread_var = defs.exists("HXCPP_COMPILE_THREADS") ?
-               defs.get("HXCPP_COMPILE_THREADS") : Sys.getEnv("HXCPP_COMPILE_THREADS");
+         var thread_var = defs.exists("HXCPP_COMPILE_THREADS") ?
+            defs.get("HXCPP_COMPILE_THREADS") : Sys.getEnv("HXCPP_COMPILE_THREADS");
 
-            if (thread_var == null)
-            {
-               sCompileThreadCount = getNumberOfProcesses();
-            }
-            else
-            {
-               sCompileThreadCount = (Std.parseInt(thread_var)<2) ? 1 : Std.parseInt(thread_var);
-            }
+         if (thread_var == null)
+         {
+            sCompileThreadCount = getNumberOfProcesses();
+         }
+         else
+         {
+            sCompileThreadCount = (Std.parseInt(thread_var)<2) ? 1 : Std.parseInt(thread_var);
          }
          if (sCompileThreadCount>1 && sThreadPool==null)
             sThreadPool = new ThreadPool(sCompileThreadCount);
@@ -420,6 +418,9 @@ class BuildTool
 
       var target:Target = mTargets.get(inTarget);
       target.checkError();
+
+      for(group in target.mFileGroups)
+         group.checkCaseCollisions();
 
       for(sub in target.mSubTargets)
          buildTarget(sub,null);
@@ -1132,7 +1133,13 @@ class BuildTool
                case "hlsl" :
                   group.addHLSL( substitute(el.att.name), substitute(el.att.profile),
                   substitute(el.att.variable), substitute(el.att.target)  );
-               case "options" : group.addOptions( substitute(el.att.name) );
+               case "options" :
+                  // Resolved now, where ifExists is checked: an imported group is built from its own
+                  // directory, where a relative Options.txt would not be found.
+                  var options = substitute(el.att.name);
+                  if (!PathManager.isAbsolute(options))
+                     options = PathManager.combine(Sys.getCwd(), options);
+                  group.addOptions(options);
                case "config" : group.mConfig = substitute(el.att.name);
                case "assembler" : group.mAssembler = substitute(el.att.name);
                case "compilerflag" :
@@ -1504,6 +1511,10 @@ class BuildTool
             }
          }
       }
+      else if (isBSD)
+      {
+         result = ProcessManager.runProcessLine("", "sysctl", [ "-n", "hw.ncpu" ], true, false, true, true);
+      }
       else if (isMac)
       {
          var cores = ~/Total Number of Cores: (\d+)/;
@@ -1526,11 +1537,31 @@ class BuildTool
       }
    }
 
+   // " (commit)" when this library is a git checkout
+   private static function getCommit():String
+   {
+      try
+      {
+         var proc = new Process("git", ["-C", HXCPP, "rev-parse", "--short", "HEAD"]);
+         var commit = StringTools.trim(proc.stdout.readAll().toString());
+         proc.stderr.readAll();
+         var code = proc.exitCode();
+         proc.close();
+         return code==0 && commit!="" ? ' ($commit)' : "";
+      }
+      catch (e:Dynamic)
+      {
+         return "";
+      }
+   }
+
    private static function getVersion():String
    {
       try
       {
-         var json = Json.parse (sys.io.File.getContent (PathManager.getHaxelib ("hxcpp") + "/haxelib.json"));
+         // This tool's own library, whatever name haxelib resolved to reach it
+         var dir = HXCPP != "" ? HXCPP : PathManager.getHaxelib ("hxcpp");
+         var json = Json.parse (sys.io.File.getContent (dir + "/haxelib.json"));
          return json.version;
       }
       catch (e:Dynamic)
@@ -1542,6 +1573,11 @@ class BuildTool
    public static function isMsvc()
    {
       return instance.mDefines.get("toolchain")=="msvc";
+   }
+
+   public static function isMsvcLlvm()
+   {
+		return isMsvc() && instance.mDefines.exists("HXCPP_MSVC_LLVM");
    }
 
    public static function isMingw()
@@ -1600,6 +1636,8 @@ class BuildTool
       var include_path = new Array<String>();
       var makefile:String="";
       var optionsTxt = "Options.txt";
+      var optionsGiven = false;
+      var generatedFor:String = null;
 
       Profile.start();
 
@@ -1663,11 +1701,14 @@ class BuildTool
       isLinux = (new EReg("linux","i")).match(os);
       if (isLinux)
          defines.set("linux_host", "1");
+      isBSD = (new EReg("bsd","i")).match(os);
+      if (isBSD)
+         defines.set("bsd_host", "1");
 
 
       if (args.length>0 && args[0].endsWith(".cppia"))
       {
-         var hostName = isWindows ? "Windows" : isMac ? "Mac" : isLinux ? "Linux" : null;
+         var hostName = isWindows ? "Windows" : isMac ? "Mac" : isLinux ? "Linux" : isBSD ? "BSD" : null;
          if (hostName==null)
             Log.error("Cppia is not supported on this host.");
          var archSuffix = switch getArch() {
@@ -1781,6 +1822,7 @@ class BuildTool
             optionsTxt = args[a];
             if (optionsTxt==null)
                optionsTxt = "";
+            optionsGiven = true;
          }
          else if (arg=="-dirty")
          {
@@ -1804,15 +1846,18 @@ class BuildTool
       if (defines.exists("HXCPP_TIMES"))
          Profile.enable();
 
-      if (defines.exists("HXCPP_NO_COLOUR") || defines.exists("HXCPP_NO_COLOR"))
-         Log.colorSupported = false;
+      Log.setColor(defines);
       Log.verbose = Log.verbose || defines.exists("HXCPP_VERBOSE");
       Log.quiet = defines.exists("HXCPP_QUIET") && !Log.verbose;
       Log.mute = defines.exists("HXCPP_SILENT") && !Log.quiet && !Log.verbose;
 
       if ( optionsTxt!="" && makefile!="")
       {
-         var path = PathManager.combine(haxe.io.Path.directory(makefile), optionsTxt);
+         // Haxe writes Options.txt next to Build.xml; one passed with -options is the caller's path
+         var path = !optionsGiven ? PathManager.combine(haxe.io.Path.directory(makefile), optionsTxt) :
+                    PathManager.isAbsolute(optionsTxt) ? optionsTxt : PathManager.combine(startDir, optionsTxt);
+         if (optionsGiven && !FileSystem.exists(path))
+            Log.warn('Options file $path does not exist');
          if (FileSystem.exists(path))
             try
             {
@@ -1827,7 +1872,7 @@ class BuildTool
                         var value = def.substr(equals+1);
                         if (name=="hxcpp")
                         {
-                           // Ignore
+                           generatedFor = value;
                         }
                         else if (name=="destination")
                             destination = value;
@@ -1862,7 +1907,36 @@ class BuildTool
          defines.set("HXCPP",HXCPP);
       }
 
-      //Log.info("", "HXCPP : " + HXCPP);
+      var version = getVersion();
+      if (Log.verbose)
+         Log.info("", 'Using hxcpp $version${getCommit()} from $HXCPP');
+      // Haxe records the hxcpp define, which can be a line of haxelib's
+      // output around the version rather than the version alone
+      var recorded = ~/[0-9]+\.[0-9]+\.[0-9]+[-+.a-zA-Z0-9]*/;
+      if (generatedFor!=null && recorded.match(generatedFor) && recorded.matched(0)!=version)
+         Log.warn('Haxe generated this code for hxcpp ${recorded.matched(0)}, but hxcpp $version from $HXCPP is building it. If that is not intended, make haxelib and HXCPP point at the same copy');
+
+      // Haxe passes its version (4.307 for 4.3.7) and API level with every
+      // build it starts; a build run by hand, such as an ndll's, has neither
+      if (defines.exists("haxe_ver"))
+      {
+         var haxeVer = defines.get("haxe_ver").split('"').join("");
+         var haxeNum = Std.parseFloat(haxeVer);
+         if (!Math.isNaN(haxeNum) && haxeNum < 4.2)
+         {
+            // 4.105 is 4.1.5
+            var parts = haxeVer.split(".");
+            var shown = parts.length==2 && parts[1].length==3 ?
+               parts[0] + "." + parts[1].charAt(0) + "." + Std.parseInt(parts[1].substr(1)) : haxeVer;
+            Log.error('hxcpp $version supports the code Haxe 4.2 and later generates, but this build is from Haxe $shown. Use Haxe 4.2 or later');
+         }
+      }
+      if (defines.exists("hxcpp_api_level"))
+      {
+         var apiLevel = Std.parseInt(defines.get("hxcpp_api_level").split('"').join(""));
+         if (apiLevel!=null && apiLevel>SupportedVersion)
+            Log.warn('This build uses hxcpp API level $apiLevel, newer than the $SupportedVersion hxcpp $version knows; it may not build or run correctly');
+      }
 
       include_path.push(".");
       if (env.exists("HOME"))
@@ -2037,7 +2111,7 @@ class BuildTool
          {
             defines.set("toolchain","msvc");
             if ( defines.exists("winrt") )
-               defines.set("BINDIR",m64 ? "WinRT64":"WinRT");
+               defines.set("BINDIR",arm64 ? "WinRTArm64" : m64 ? "WinRT64":"WinRT");
          }
          else
          {
@@ -2045,21 +2119,38 @@ class BuildTool
             defines.set("mingw","mingw");
          }
       }
-      else if ( (new EReg("linux","i")).match(os) )
+      // A Pi running a 64-bit system builds as Linux ARM64
+      else if ( isRPi && !arm64 )
+      {
+         defines.set("toolchain","linux");
+         defines.set("linux","linux");
+         defines.set("rpi","1");
+         defines.set("hardfp","1");
+         defines.set("BINDIR", "RPi");
+      }
+      // The BSDs build with the Linux toolchain
+      else if ( (new EReg("linux|bsd","i")).match(os) )
       {
          set64(defines,m64,arm64);
          // Cross-compile?
          if(defines.exists("windows"))
          {
-            defines.set("toolchain","mingw");
-            defines.set("mingw", "mingw");
-            defines.set("xcompile","1");
+            if (defines.exists("HXCPP_MSVC_LLVM"))
+               defines.set("toolchain", "msvc");
+            else
+            {
+               defines.set("toolchain","mingw");
+               defines.set("mingw", "mingw");
+            }
+            defines.set("xcompile", "1");
             defines.set("BINDIR", arm64 ? "WindowsArm64" : m64 ? "Windows64":"Windows");
          }
          else
          {
             defines.set("toolchain","linux");
             defines.set("linux","linux");
+            if (isBSD)
+               defines.set("bsd","bsd");
 
             if (armv7 || defines.exists("HXCPP_LINUX_ARMV7"))
             {
@@ -2075,7 +2166,8 @@ class BuildTool
                defines.set("HXCPP_ARM64","1");
                m64 = true;
             }
-            defines.set("BINDIR", arm64 ? "LinuxArm64" : armv7 ? "LinuxArm" : m64 ? "Linux64" : "Linux");
+            var platform = isBSD ? "BSD" : "Linux";
+            defines.set("BINDIR", platform + (arm64 ? "Arm64" : armv7 ? "Arm" : m64 ? "64" : ""));
          }
       }
       else if ( (new EReg("mac","i")).match(os) )
@@ -2293,7 +2385,7 @@ class BuildTool
                       new CopyFile(substitute(el.att.name),
                                    substitute(el.att.from),
                                    el.has.allowMissing ?  subBool(el.att.allowMissing) : false,
-                                   el.has.overwrite ? substitute(el.att.overwrite) : Overwrite.ALWAYS,
+                                   el.has.overwrite ? CopyFile.parseOverwrite(substitute(el.att.overwrite)) : Overwrite.ALWAYS,
                                    el.has.toolId ?  substitute(el.att.toolId) : null ) );
                case "section" :
                   parseXML(el,"",forceRelative);
@@ -2347,7 +2439,6 @@ class BuildTool
             return;
 
          pushFile(full_name, "include", inSection);
-         // TODO - use mFileStack?
          var oldInclude = mCurrentIncludeFile;
          mCurrentIncludeFile = full_name;
 

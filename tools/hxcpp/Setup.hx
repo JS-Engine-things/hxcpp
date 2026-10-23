@@ -686,7 +686,8 @@ class Setup
    public static function setupMSVC(ioDefines:Hash<String>, in64:Bool, inArm64:Bool, isWinRT:Bool)
    {
       var detectMsvc = !ioDefines.exists("NO_AUTO_MSVC") &&
-                       !ioDefines.exists("HXCPP_MSVC_CUSTOM");
+                       !ioDefines.exists("HXCPP_MSVC_CUSTOM") &&
+                       !ioDefines.exists("HXCPP_MSVC_ROOT");
 
       if (ioDefines.exists("HXCPP_MSVC_VER"))
       {
@@ -696,7 +697,7 @@ class Setup
          else
          {
             var ival = Std.parseInt(ioDefines.get("HXCPP_MSVC_VER"));
-            if (ival>0)
+            if (ival>=140)
             {
                var varName = "VS" + ival+ "COMNTOOLS";
                var where = Sys.getEnv(varName);
@@ -717,11 +718,15 @@ class Setup
                Sys.putEnv("HXCPP_MSVC", where);
                Log.setup('Using MSVC Ver $ival in $where ($varName)');
             }
-            else
+            else if (ival == null)
             {
                Log.setup('Using specified MSVC Ver $val');
                ioDefines.set("HXCPP_MSVC", val );
                Sys.putEnv("HXCPP_MSVC", val);
+            }
+            else
+            {
+               Log.error('HXCPP_MSVC_VER ${ival} is not supported');
             }
         }
       }
@@ -800,6 +805,8 @@ class Setup
          }
       }
 
+      if (ioDefines.exists("HXCPP_MSVC_LLVM")) return;
+
       try
       {
          var proc = new Process("cl.exe",[]);
@@ -814,20 +821,16 @@ class Setup
                var cl_version = Std.parseInt(reg.matched(1));
                Log.setup("Using MSVC version: " + cl_version);
                ioDefines.set("MSVC_VER", cl_version+"");
-               if (cl_version>=17)
-                  ioDefines.set("MSVC17+","1");
-               if (cl_version>=18)
-                  ioDefines.set("MSVC18+","1");
-               if (cl_version==19)
-                  ioDefines.set("MSVC19","1");
-               BuildTool.sAllowNumProcs = cl_version >= 14;
+               // deprecated
+               ioDefines.set("MSVC17+","1");
+               ioDefines.set("MSVC18+","1");
+               ioDefines.set("MSVC19","1");
                var threads = BuildTool.getThreadCount();
-               if (threads>1 && cl_version>=18)
+               if (threads>1)
                   ioDefines.set("HXCPP_FORCE_PDB_SERVER","1");
             }
          }
       } catch(e:Dynamic){}
-      //if (cl_version!="") BuildTool.println("Using cl version: " + cl_version);
    }
 
    static function toPath(inPath:String)

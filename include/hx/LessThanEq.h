@@ -10,6 +10,8 @@ enum {
    CompareAsDouble,
    CompareAsString,
    CompareAsDynamic,
+   // A Bool known only at run time; it equals only another Bool
+   CompareAsBool,
 };
 
 
@@ -29,7 +31,8 @@ struct CompareTraits
          return CompareAsDynamic;
       switch(inValue->__GetType())
       {
-         case vtInt: case vtBool: return CompareAsInt;
+         case vtInt: return CompareAsInt;
+         case vtBool: return CompareAsBool;
          case vtInt64: return CompareAsInt64;
          case vtFloat: return CompareAsDouble;
          case vtString: return CompareAsString;
@@ -184,7 +187,8 @@ struct CompareTraits< cpp::Variant >
    {
       switch(inValue.type)
       {
-         case cpp::Variant::typeInt: case cpp::Variant::typeBool: return CompareAsInt;
+         case cpp::Variant::typeInt: return CompareAsInt;
+         case cpp::Variant::typeBool: return CompareAsBool;
          case cpp::Variant::typeInt64: return CompareAsInt64;
          case cpp::Variant::typeDouble: return CompareAsDouble;
          case cpp::Variant::typeString: return CompareAsString;
@@ -195,7 +199,8 @@ struct CompareTraits< cpp::Variant >
                   return CompareAsDynamic;
                switch(inValue.valObject->__GetType())
                {
-                  case vtInt: case vtBool: return CompareAsInt;
+                  case vtInt: return CompareAsInt;
+                  case vtBool: return CompareAsBool;
                   case vtInt64: return CompareAsInt64;
                   case vtFloat: return CompareAsDouble;
                   case vtString: return CompareAsString;
@@ -336,32 +341,17 @@ inline bool TestLessEq(const T1 &v1, const T2 &v2)
    }
    else if (traits1::type<=(int)CompareAsString && traits2::type<=(int)CompareAsString)
    {
-      // String with a number...
-      return false;
+      // String with a number: never equal and not ordered, so only the
+      // not-equal operator is satisfied
+      return !LESS && !EQ;
    }
-   else if (traits1::type==(int)CompareAsString || traits2::type==(int)CompareAsString)
-   {
-      // String with a object...
-      return LESS ? ( EQ ? traits1::toString(v1) <= traits2::toString(v2) :
-                           traits1::toString(v1) <  traits2::toString(v2)  ) :
-                    ( EQ ? traits1::toString(v1) == traits2::toString(v2) :
-                           traits1::toString(v1) != traits2::toString(v2)  );
-   }
-   else if (traits1::type<=(int)CompareAsDouble || traits2::type<=(int)CompareAsDouble)
-   {
-      // numeric with a object...
-
-      // null can only be equal to null...
-      bool n1 = traits1::isNull(v1);
-      bool n2 = traits2::isNull(v2);
-      if (n1 || n2)
-         return EQ ? n1==n2 : !LESS && n1!=n2/* false,false = not equal*/;
-
-      return LESS ? ( EQ ? traits1::toDouble(v1) <= traits2::toDouble(v2) :
-                           traits1::toDouble(v1) <  traits2::toDouble(v2)  ) :
-                    ( EQ ? traits1::toDouble(v1) == traits2::toDouble(v2) :
-                           traits1::toDouble(v1) != traits2::toDouble(v2)  );
-   }
+   // Note: there used to be branches here for a statically numeric or
+   // String operand against a dynamic one, which converted the dynamic side
+   // without checking its runtime type - so 5 == ("5":Dynamic) and
+   // ("5":String) == (5:Dynamic) were true.  The dynamic dispatch below gives
+   // the same results where those were right; for the statically-typed side
+   // getDynamicCompareType is a compile-time constant, so the cost is
+   // unchanged.
    else
    {
       // Dynamic compare.
@@ -375,6 +365,13 @@ inline bool TestLessEq(const T1 &v1, const T2 &v2)
 
       int t1 = traits1::getDynamicCompareType(v1);
       int t2 = traits2::getDynamicCompareType(v2);
+
+      if (t1==(int)CompareAsBool || t2==(int)CompareAsBool)
+      {
+         if (t1!=t2)
+            return !LESS && !EQ;
+         t1 = t2 = (int)CompareAsInt;
+      }
 
       if (t1==(int)CompareAsInt && t2==(int)CompareAsInt)
       {
@@ -406,8 +403,9 @@ inline bool TestLessEq(const T1 &v1, const T2 &v2)
       }
       else if (t1<=(int)CompareAsString && t2<=(int)CompareAsString)
       {
-         // String with a number...
-         return false;
+         // String with a number: never equal and not ordered, so only the
+         // not-equal operator is satisfied
+         return !LESS && !EQ;
       }
       else if (t1==(int)CompareAsString || t2==(int)CompareAsString)
       {

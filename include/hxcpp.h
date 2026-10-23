@@ -207,8 +207,8 @@ typedef char HX_CHAR;
 #pragma warning(disable:4251)
 #pragma warning(disable:4800)
 
-#if defined(_MSC_VER) && _MSC_VER < 1201
-#error MSVC 7.1 does not support template specialization and is not supported by HXCPP
+#if defined(_MSC_VER) && _MSC_VER < 1900
+#error hxcpp needs Visual Studio 2015 or later
 #endif
 
 
@@ -236,7 +236,6 @@ namespace cpp
    #ifdef _WIN32
    typedef __int64 Int64;
    typedef unsigned __int64 UInt64;
-   // TODO - EMSCRIPTEN?
    #else
    typedef int64_t Int64;
    typedef uint64_t UInt64;
@@ -287,8 +286,8 @@ class Dynamic;
 class String;
 
 // Use an external routine to throw to avoid sjlj overhead on iphone.
-namespace hx { HXCPP_EXTERN_CLASS_ATTRIBUTES Dynamic Throw(Dynamic inDynamic); }
-namespace hx { HXCPP_EXTERN_CLASS_ATTRIBUTES Dynamic Rethrow(Dynamic inDynamic); }
+namespace hx { [[noreturn]] HXCPP_EXTERN_CLASS_ATTRIBUTES Dynamic Throw(Dynamic inDynamic); }
+namespace hx { [[noreturn]] HXCPP_EXTERN_CLASS_ATTRIBUTES Dynamic Rethrow(Dynamic inDynamic); }
 namespace hx { HXCPP_EXTERN_CLASS_ATTRIBUTES void CriticalError(const String &inError, bool inAllowFixup=false); }
 namespace hx { HXCPP_EXTERN_CLASS_ATTRIBUTES void NullReference(const char *type, bool allowFixup); }
 namespace hx { extern String sNone[]; }
@@ -384,6 +383,9 @@ typedef PropertyAccessMode PropertyAccess;
 #include <hx/Boot.h>
 #include <hx/Undefine.h>
 #include <hx/LessThanEq.h>
+#ifdef HXCPP_SCRIPTABLE
+#include <hx/Scriptable.h>
+#endif
 
 #endif
 

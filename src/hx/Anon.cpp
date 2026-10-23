@@ -1,5 +1,8 @@
 #include <hxcpp.h>
 #undef RegisterClass
+
+bool __string_hash_query(Dynamic &ioHash,const String &inKey,Dynamic &outValue);
+
 namespace hx
 {
 
@@ -10,10 +13,7 @@ bool FieldMapGet(FieldMap *inMap, const String &inName, Dynamic &outValue)
    if (!inMap || !inMap->mPtr)
       return false;
 
-   if (!__string_hash_exists(*inMap,inName))
-      return false;
-   outValue = __string_hash_get(*inMap, inName);
-   return true;
+   return __string_hash_query(*inMap,inName,outValue);
 }
 
 
@@ -22,11 +22,7 @@ bool FieldMapGet(FieldMap *inMap, int inId, Dynamic &outValue)
    if (!inMap || !inMap->mPtr)
       return false;
 
-   const String &key = __hxcpp_field_from_id(inId);
-   if (!__string_hash_exists(*inMap,key))
-      return false;
-   outValue = __string_hash_get(*inMap, key);
-   return true;
+   return __string_hash_query(*inMap,__hxcpp_field_from_id(inId),outValue);
 }
 
 
@@ -97,7 +93,7 @@ void Anon_obj::__Visit(hx::VisitContext *__inCtx)
 
 inline int Anon_obj::findFixed(const ::String &inKey, bool inSkip5)
 {
-   if (!mFixedFields || !inKey.isAsciiEncoded() )
+   if (!mFixedFields || !inKey.__s)
       return -1;
    VariantKey *fixed = getFixed();
 
@@ -119,8 +115,7 @@ inline int Anon_obj::findFixed(const ::String &inKey, bool inSkip5)
       if (mFixedFields<5)
       {
          for(int i=0;i<mFixedFields;i++)
-            if (fixed[i].hash==sought && (
-                   (fixed[i].key.length == inKey.length && !memcmp(fixed[i].key.raw_ptr(),inKey.raw_ptr(), inKey.length))))
+            if (fixed[i].hash==sought && fixed[i].key.eq(inKey))
                return i;
          return -1;
       }
@@ -136,6 +131,10 @@ inline int Anon_obj::findFixed(const ::String &inKey, bool inSkip5)
    */
 
    int min = inSkip5 ? 5 : 0;
+   // With exactly 5 fixed fields the skip5 path would read one past the
+   // allocated VariantKey array
+   if (min>=mFixedFields)
+      return -1;
    if (fixed[min].hash>sought)
       return -1;
    if (fixed[min].hash!=sought)
@@ -152,12 +151,18 @@ inline int Anon_obj::findFixed(const ::String &inKey, bool inSkip5)
          else
             max = mid;
       }
+
+      // The search converges on the last entry with this hash - back up to
+      // the first one so the scan below sees the whole run of duplicates
+      int base = inSkip5 ? 5 : 0;
+      while(min>base && fixed[min-1].hash==sought)
+         min--;
    }
 
    while(fixed[min].hash==sought)
    {
       // Might be multiple?
-      if ( fixed[min].key.length == inKey.length && !memcmp(fixed[min].key.raw_ptr(),inKey.raw_ptr(), inKey.length))
+      if (fixed[min].key.eq(inKey))
          return min;
 
       min++;
@@ -172,7 +177,13 @@ hx::Val Anon_obj::__Field(const String &inName, hx::PropertyAccess inCallProp)
 {
 
    #ifdef HX_SMART_STRINGS
-   if (inName.isAsciiEncodedQ())
+   if (!inName.isAsciiEncodedQ())
+   {
+      int fixed = findFixed(inName);
+      if (fixed>=0)
+         return getFixed()[fixed].value;
+   }
+   else
    #endif
    if (mFixedFields>0)
    {
@@ -241,7 +252,10 @@ bool Anon_obj::__Remove(String inKey)
    if (slot>=0)
    {
       VariantKey *fixed = getFixed();
-      while(slot<mFixedFields)
+      // Shift the elements after 'slot' down by one. Stop at mFixedFields-1:
+      // fixed[] only has mFixedFields slots, so reading fixed[mFixedFields]
+      // would be an out-of-bounds access (and a String/Variant copy from it).
+      while(slot<mFixedFields-1)
       {
          fixed[slot] = fixed[slot+1];
          slot++;
@@ -298,7 +312,8 @@ Anon_obj *Anon_obj::Add(const String &inName,const Dynamic &inValue,bool inSetTh
    return this;
 }
 
-static int _hx_toString_depth = 0;
+// Per thread: formatting on another thread is not recursion
+static thread_local int _hx_toString_depth = 0;
 String Anon_obj::toString()
 {
    if (!mFields.mPtr && !mFixedFields)

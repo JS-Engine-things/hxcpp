@@ -2,12 +2,17 @@
 #include <hxMath.h>
 #include <hx/Memory.h>
 #include <hx/Thread.h>
+#include "FastMutex.h"
 
 #ifdef HX_WINDOWS
 #include <windows.h>
 #include <io.h>
 #elif defined(__unix__) || defined(__APPLE__)
 #include <sys/time.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#include <mach/mach_time.h>
+#endif
 #ifndef __EMSCRIPTEN__
 typedef int64_t __int64;
 #endif
@@ -25,6 +30,7 @@ typedef int64_t __int64;
 #include <time.h>
 #include <clocale>
 #include <mutex>
+#include <chrono>
 
 
 #ifdef HX_WINRT
@@ -50,7 +56,6 @@ Dynamic Throw(Dynamic inDynamic)
    __hx_stack_set_last_exception();
    #endif
    throw inDynamic;
-   return null();
 }
 
 
@@ -60,7 +65,6 @@ Dynamic Rethrow(Dynamic inDynamic)
    __hx_stack_push_last_exception();
    #endif
    throw inDynamic;
-   return null();
 }
 
 
@@ -89,6 +93,12 @@ void RegisterResources(Resource *inResources)
       sgSecondResources = inResources;
    else
       sgResources = inResources;
+}
+
+void UnregisterResources(Resource *inResources)
+{
+   if (sgSecondResources==inResources)
+      sgSecondResources = 0;
 }
 
 }
@@ -142,9 +152,8 @@ String __hxcpp_resource_string(String inName)
                if (p[i]>127)
                   return _hx_utf8_to_utf16(p, reso->mDataLength,false);
             #endif
-            return String((const char *) reso->mData, reso->mDataLength );
-
-            return String((const char *) reso->mData, reso->mDataLength );
+            // A script's resources are freed with its module
+            return String::create((const char *) reso->mData, reso->mDataLength );
          }
    }
    return null();
@@ -210,22 +219,80 @@ namespace hx
 // --- System ---------------------------------------------------------------------
 
 // --- Maths ---------------------------------------------------------
-static double rand_scale = 1.0 / (1<<16) / (1<<16);
+// Thread-local xoshiro256++ generator.  The old C rand() backing took a
+// global libc lock per call on glibc (three calls per Math.random()),
+// produced the same default-seeded sequence on every Windows worker
+// thread (MSVC rand state is per-thread but only the booting thread was
+// seeded), and had only 32 bits of state.
+namespace
+{
+   inline unsigned long long hxRotl64(unsigned long long x, int k)
+   {
+      return (x << k) | (x >> (64 - k));
+   }
+
+   struct HxRandState
+   {
+      unsigned long long s[4];
+      bool seeded;
+
+      void seed()
+      {
+         // The TLS address is distinct per live thread, the counters are
+         // distinct per run - splitmix64 whitens them into a full state
+         unsigned long long mix = (unsigned long long)(size_t)this;
+         mix ^= ((unsigned long long)time(0)) << 24;
+         mix ^= (unsigned long long)clock();
+         // Fine-grained on every platform, so two runs started in the same
+         // second (with no address randomisation) still differ
+         mix ^= (unsigned long long)std::chrono::high_resolution_clock::now().time_since_epoch().count();
+         #ifdef HX_WINDOWS
+         LARGE_INTEGER now;
+         QueryPerformanceCounter(&now);
+         mix ^= (unsigned long long)now.QuadPart;
+         #endif
+         for(int i=0;i<4;i++)
+         {
+            mix += 0x9e3779b97f4a7c15ULL;
+            unsigned long long z = mix;
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+            s[i] = z ^ (z >> 31);
+         }
+         seeded = true;
+      }
+
+      inline unsigned long long next()
+      {
+         if (!seeded)
+            seed();
+         unsigned long long result = hxRotl64(s[0] + s[3], 23) + s[0];
+         unsigned long long t = s[1] << 17;
+         s[2] ^= s[0];
+         s[3] ^= s[1];
+         s[1] ^= s[2];
+         s[0] ^= s[3];
+         s[2] ^= t;
+         s[3] = hxRotl64(s[3], 45);
+         return result;
+      }
+   };
+
+   thread_local HxRandState sHxRand;
+}
+
 double __hxcpp_drand()
 {
-   unsigned int lo = rand() & 0xfff;
-   unsigned int mid = rand() & 0xfff;
-   unsigned int hi = rand() & 0xff;
-   double result = (lo | (mid<<12) | (hi<<24) ) * rand_scale;
-   return result;
+   // 53 random mantissa bits in [0,1)
+   return (sHxRand.next() >> 11) * (1.0/9007199254740992.0);
 }
 
 int __hxcpp_irand(int inMax)
 {
-   unsigned int lo = rand() & 0xfff;
-   unsigned int mid = rand() & 0xfff;
-   unsigned int hi = rand() & 0xff;
-   return (lo | (mid<<12) | (hi<<24) ) % inMax;
+   if (inMax<=0)
+      return 0;
+   // Multiply-shift bounding - cheaper than modulo and avoids its bias
+   return (int)(( (sHxRand.next()>>32) * (unsigned long long)(unsigned int)inMax ) >> 32);
 }
 
 #ifdef HX_WINDOWS
@@ -301,6 +368,21 @@ void WriteConsoleAllA(HANDLE h, const char *str, DWORD length) {
 }
 #endif
 
+#ifdef HX_WINDOWS
+// stdout console state - GetConsoleMode is a kernel round-trip, so probing
+// it per print made every println pay a syscall even when redirected.
+// Cached once: a process's stdout handle does not change under us in any
+// supported configuration.
+static bool hxStdoutIsConsole(HANDLE &outHandle)
+{
+   static HANDLE sHandle = GetStdHandle(STD_OUTPUT_HANDLE);
+   static DWORD sMode = 0;
+   static bool sIsConsole = GetConsoleMode(sHandle, &sMode) != 0;
+   outHandle = sHandle;
+   return sIsConsole;
+}
+#endif
+
 void __trace(Dynamic inObj, Dynamic info)
 {
    String text;
@@ -308,44 +390,30 @@ void __trace(Dynamic inObj, Dynamic info)
       text = inObj->toString();
 
 #ifdef HX_WINDOWS
-   HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
-   DWORD mode;
-   if (!GetConsoleMode(handle, &mode))
-   {
+   HANDLE handle;
+   if (!hxStdoutIsConsole(handle))
       return;
-   }
 
    fflush(stdout);
-
    String s;
-
-   if (info==null()) {
-      s = String("?? ") + text + String("\n");
+   if (info == null()) {
+      s = HX_CSTRING("?? ") + text + HX_CSTRING("\n");
    } else {
       String filename = Dynamic((info)->__Field(HX_CSTRING("fileName"), HX_PROP_DYNAMIC))->toString();
       int line = Dynamic((info)->__Field(HX_CSTRING("lineNumber"), HX_PROP_DYNAMIC))->__ToInt();
-      s = filename + String(":") + line + String(": ") + text + String("\n");
+      s = filename + HX_CSTRING(":") + line + HX_CSTRING(": ") + text + HX_CSTRING("\n");
    }
-
    if (s.isUTF16Encoded())
-   {
       WriteConsoleAllW(handle, s.__WCStr(), s.length);
-   }
    else
-   {
       WriteConsoleAllA(handle, s.__CStr(), s.length);
-   }
 #else
-
 #if defined(HX_MACOS) || defined(HX_LINUX)
    if (!isatty(STDOUT_FILENO))
-   {
       return;
-   }
 #endif
 
    hx::strbuf convertBuf;
-
    if (info==null())
    {
       PRINTF("?? %s\n", text.raw_ptr() ? text.out_str(&convertBuf) : "null");
@@ -354,9 +422,6 @@ void __trace(Dynamic inObj, Dynamic info)
    {
       const char *filename = Dynamic((info)->__Field(HX_CSTRING("fileName"), HX_PROP_DYNAMIC))->toString().utf8_str(0,false);
       int line = Dynamic((info)->__Field( HX_CSTRING("lineNumber") , HX_PROP_DYNAMIC))->__ToInt();
-
-      hx::strbuf convertBuf;
-      //PRINTF("%s:%d: %s\n", filename, line, text.raw_ptr() ? text.out_str(&convertBuf) : "null");
       PRINTF("%s:%d: %s\n", filename, line, text.raw_ptr() ? text.out_str(&convertBuf) : "null");
    }
    fflush(stdout);
@@ -370,29 +435,29 @@ void __hxcpp_exit(int inExitCode)
 
 double  __time_stamp()
 {
+// The starting point is set by the first call, from whichever thread makes it.
+// Static locals are initialised exactly once even when threads race to it,
+// where a check for zero let two threads both set it, and on Apple let one
+// read the timebase while another filled it in.
 #ifdef HX_WINDOWS
-   static __int64 t0=0;
-   static double period=0;
+   static const __int64 t0 = []() { __int64 v = 0; QueryPerformanceCounter((LARGE_INTEGER*)&v); return v; }();
+   static const double period = qpcFrequency.QuadPart ? 1.0/qpcFrequency.QuadPart : 0;
    __int64 now;
 
-   if (QueryPerformanceCounter((LARGE_INTEGER*)&now))
-   {
-      if (t0==0)
-      {
-         t0 = now;
-         period = 1.0/qpcFrequency.QuadPart;
-      }
-      if (period!=0)
-         return (now-t0)*period;
-   }
+   if (period!=0 && QueryPerformanceCounter((LARGE_INTEGER*)&now))
+      return (now-t0)*period;
    return (double)clock() / ( (double)CLOCKS_PER_SEC);
-#elif defined(__unix__) || defined(__APPLE__)
-   static double t0 = 0;
-   struct timeval tv;
-   if( gettimeofday(&tv,0) )
+#elif defined(__APPLE__)
+   static const mach_timebase_info_data_t timebase = []() { mach_timebase_info_data_t tb; mach_timebase_info(&tb); return tb; }();
+   static const unsigned long long t0 = mach_absolute_time();
+   unsigned long long now = mach_absolute_time();
+   return (double)(now-t0) * timebase.numer / timebase.denom * 1e-9;
+#elif defined(__unix__)
+   struct timespec ts;
+   if( clock_gettime(CLOCK_MONOTONIC,&ts) )
       throw Dynamic("Could not get time");
-   double t =  ( tv.tv_sec + ((double)tv.tv_usec) / 1000000.0 );
-   if (t0==0) t0 = t;
+   double t =  ( ts.tv_sec + ((double)ts.tv_nsec) / 1000000000.0 );
+   static const double t0 = t;
    return t-t0;
 #else
    return (double)clock() / ( (double)CLOCKS_PER_SEC);
@@ -649,25 +714,20 @@ Array<String> __get_args()
 }
 
 
-void __hxcpp_print_string(const String &inV)
+void __hxcpp_print_string(const String &inString)
 {
+   const String &inV = inString.raw_ptr() ? inString : HX_CSTRING("null");
 #ifdef HX_WINDOWS
-   HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
-   DWORD mode;
-   if (!GetConsoleMode(handle, &mode))
-   {
+   HANDLE handle;
+   if (!hxStdoutIsConsole(handle))
       return;
-   }
 
    fflush(stdout);
-
    WriteConsoleAllW(handle, inV.__WCStr(), inV.length);
 #else
 #if defined(HX_MACOS) || defined(HX_LINUX)
    if (!isatty(STDOUT_FILENO))
-   {
       return;
-   }
 #endif
 
    hx::strbuf convertBuf;
@@ -675,29 +735,22 @@ void __hxcpp_print_string(const String &inV)
 #endif
 }
 
-void __hxcpp_println_string(const String &inV)
+void __hxcpp_println_string(const String &inString)
 {
+   const String &inV = inString.raw_ptr() ? inString : HX_CSTRING("null");
 #ifdef HX_WINDOWS
-   HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
-   DWORD mode;
-   if (!GetConsoleMode(handle, &mode))
-   {
+   HANDLE handle;
+   if (!hxStdoutIsConsole(handle))
       return;
-   }
 
    fflush(stdout);
-
    WriteConsoleAllW(handle, inV.__WCStr(), inV.length);
-
    fwrite("\n", 1, 1, stdout);
-
    fflush(stdout);
 #else
 #if defined(HX_MACOS) || defined(HX_LINUX)
    if (!isatty(STDOUT_FILENO))
-   {
       return;
-   }
 #endif
 
    hx::strbuf convertBuf;
@@ -719,12 +772,24 @@ bool __instanceof(const Dynamic &inValue, const Dynamic &inType)
    hx::Class c = inType;
    if (c==null())
       return false;
+   // Classes and enums are both Class_obj, so the Class and Enum types are told
+   // apart by whether the value is an enum, as on the other targets
+   if (c.mPtr==hx::Class_obj::__SGetClass().mPtr || c.mPtr==hx::GetEnumClass().mPtr)
+   {
+      hx::Class_obj *value = dynamic_cast<hx::Class_obj *>(inValue.GetPtr());
+      return value && value->__IsEnum()==(c.mPtr==hx::GetEnumClass().mPtr);
+   }
    return c->CanCast(inValue.GetPtr());
 }
 
 
 int __int__(double x)
 {
+   // NaN slips past both range comparisons into an undefined (int) cast -
+   // MSVC x64 yields INT_MIN, ARM yields 0, so Math.floor(NaN) differed
+   // across platforms of the same target
+   if (x != x)
+      return 0;
    #ifndef __EMSCRIPTEN__
    if (x < -0x7fffffff || x>0x7fffffff )
    {
@@ -737,10 +802,78 @@ int __int__(double x)
 }
 
 
-static inline bool is_hex_string(const char *c, int len)
+// A hex prefix with a character after it. Each character is read only once
+// the one before it matched, so the string is never measured or overrun
+static inline bool is_hex_string(const char *c)
 {
-   return (len > 2 && c[0] == '0' && (c[1] == 'x' || c[1] == 'X'))
-      || (len > 3 && (c[0] == '-' || c[0] == '+') && c[1] == '0' && (c[2] == 'x' || c[2] == 'X'));
+   return (c[0] == '0' && (c[1] == 'x' || c[1] == 'X') && c[2])
+      || ((c[0] == '-' || c[0] == '+') && c[1] == '0' && (c[2] == 'x' || c[2] == 'X') && c[3]);
+}
+
+// Locale-independent strtod - the process locale is global mutable state
+// that host frameworks change after boot, which flips the decimal separator
+// and silently breaks parseFloat (see the matching helper in String.cpp)
+#if defined(HX_WINDOWS) && !defined(HX_WINRT)
+static double hxStrtodC(const char *inStr, char **outEnd)
+{
+   static _locale_t cLoc = _create_locale(LC_NUMERIC, "C");
+   return _strtod_l(inStr, outEnd, cLoc);
+}
+#elif defined(__APPLE__) || defined(__GLIBC__) || (defined(__ANDROID_API__) && __ANDROID_API__>=21)
+#ifdef __APPLE__
+#include <xlocale.h>
+#endif
+static double hxStrtodC(const char *inStr, char **outEnd)
+{
+   static locale_t cLoc = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+   locale_t old = uselocale(cLoc);
+   double result = strtod(inStr, outEnd);
+   uselocale(old);
+   return result;
+}
+#else
+static double hxStrtodC(const char *inStr, char **outEnd)
+{
+   return strtod(inStr, outEnd);
+}
+#endif
+
+static bool hxParseIntChars(const char *str, int &outResult)
+{
+   // On the first non space char check to see if we've got a hex string.
+   // isspace requires an unsigned char value - a negative char (any
+   // non-ASCII utf8 byte) is undefined behaviour
+   while (isspace((unsigned char)*str)) ++str;
+   bool isHex = is_hex_string(str);
+   char *end = 0;
+   // Parse at a fixed 64-bit width so the overflow behaviour does not
+   // depend on the platform's long size (32-bit on Windows, 64-bit on
+   // most others)
+   long long result;
+   if (isHex)
+   {
+      bool neg = str[0] == '-';
+      if (neg) str++;
+      result = (long long)strtoull(str,&end,16);
+      if (neg) result = -result;
+   }
+   else
+   {
+      result = strtoll(str,&end,10);
+      // Saturate decimal values to the Int range on every platform
+      if (result > 0x7fffffffLL)
+         result = 0x7fffffffLL;
+      else if (result < -0x80000000LL)
+         result = -0x80000000LL;
+   }
+   #ifdef HX_WINDOWS
+   if (str==end && !isHex)
+   #else
+   if (str==end)
+   #endif
+      return false;
+   outResult = (int)result;
+   return true;
 }
 
 Dynamic __hxcpp_parse_int(const String &inString)
@@ -748,46 +881,53 @@ Dynamic __hxcpp_parse_int(const String &inString)
    if (!inString.raw_ptr())
       return null();
    hx::strbuf buf;
-   const char *str = inString.utf8_str(&buf);
-
-   // On the first non space char check to see if we've got a hex string
-   while (isspace(*str)) ++str;
-   bool isHex = is_hex_string(str, strlen(str));
-   char *end = 0;
-   long result;
-   if (isHex)
-   {
-      bool neg = str[0] == '-';
-      if (neg) str++;
-      result = strtoul(str,&end,16);
-      if (neg) result = -result;
-   }
-   else 
-      result = strtol(str,&end,10);
-   #ifdef HX_WINDOWS
-   if (str==end && !isHex)
-   #else
-   if (str==end)
-   #endif
+   int result;
+   if (!hxParseIntChars(inString.utf8_str(&buf), result))
       return null();
-   return (int)result;
+   return result;
+}
+
+int __hxcpp_parse_substr_int(const String &inString,int start, int length)
+{
+   if (length<0)
+      length = inString.length - start;
+   if (start<0 || start>=inString.length || length<1 || length>inString.length-start)
+      return 0;
+
+   hx::strbuf buf;
+   const char *str = inString.ascii_substr(&buf,start,length);
+   int result = 0;
+   if (!str || !hxParseIntChars(str, result))
+      return 0;
+   return result;
 }
 
 
+// strtod also reads inf, nan and hex, which parseFloat does not. "Infinity"
+// is read, as JavaScript does, so Std.string of an infinity reads back.
+static double hxParseFloatChars(const char *str)
+{
+   while (isspace((unsigned char)*str)) ++str;
+   const char *digits = str;
+   bool neg = *digits=='-';
+   if (*digits=='+' || *digits=='-') ++digits;
+   if (!strncmp(digits,"Infinity",8))
+      return neg ? -Math_obj::POSITIVE_INFINITY : Math_obj::POSITIVE_INFINITY;
+   if (digits[0]=='0' && (digits[1]=='x' || digits[1]=='X'))
+      return neg ? -0.0 : 0.0;
+   if (!isdigit((unsigned char)*digits) && !(*digits=='.' && isdigit((unsigned char)digits[1])))
+      return Math_obj::NaN;
+   return hxStrtodC(str,0);
+}
+
 double __hxcpp_parse_substr_float(const String &inString,int start, int length)
 {
-   if (start>=inString.length || length<1 || (start+length)>inString.length )
+   if (start<0 || start>=inString.length || length<1 || length>inString.length-start)
       return Math_obj::NaN;
 
    hx::strbuf buf;
    const char *str = inString.ascii_substr(&buf,start,length);
-   char *end = (char *)str;
-   double result = str ? strtod(str,&end) : 0;
-
-   if (end==str)
-      return Math_obj::NaN;
-
-   return result;
+   return str ? hxParseFloatChars(str) : Math_obj::NaN;
 }
 
 
@@ -798,13 +938,7 @@ double __hxcpp_parse_float(const String &inString)
 
    hx::strbuf buf;
    const char *str = inString.utf8_str(&buf);
-   char *end = (char *)str;
-   double result = str ? strtod(str,&end) : 0;
-
-   if (end==str)
-      return Math_obj::NaN;
-
-   return result;
+   return str ? hxParseFloatChars(str) : Math_obj::NaN;
 }
 
 
@@ -875,9 +1009,19 @@ Dynamic __hxcpp_create_var_args(Dynamic &inArrayFunc)
 
 
 
-static std::mutex sgFieldMapMutex;
+static hx::FastMutex &sgFieldMapMutex = *new hx::FastMutex();
 
-typedef std::map<std::string,int> StringToField;
+// Transparent comparator: lets find() take the raw char* without
+// constructing a std::string (a heap allocation) per lookup - val_id is
+// called from native extensions inside per-frame callbacks
+struct FieldNameLess
+{
+   typedef void is_transparent;
+   bool operator()(const std::string &a, const std::string &b) const { return a < b; }
+   bool operator()(const std::string &a, const char *b) const { return a.compare(b) < 0; }
+   bool operator()(const char *a, const std::string &b) const { return b.compare(a) > 0; }
+};
+typedef std::map<std::string,int,FieldNameLess> StringToField;
 
 // These need to be pointers because of the unknown order of static object construction.
 String *sgFieldToString=0;
@@ -899,7 +1043,7 @@ const String &__hxcpp_field_from_id( int f )
 
 int  __hxcpp_field_to_id( const char *inFieldName )
 {
-   std::lock_guard<std::mutex> lock(sgFieldMapMutex);
+   std::lock_guard<hx::FastMutex> lock(sgFieldMapMutex);
 
    if (!sgFieldToStringAlloc)
    {
@@ -909,13 +1053,12 @@ int  __hxcpp_field_to_id( const char *inFieldName )
       sgStringToField = new StringToField;
    }
 
-   std::string f(inFieldName);
-   StringToField::iterator i = sgStringToField->find(f);
+   StringToField::iterator i = sgStringToField->find(inFieldName);
    if (i!=sgStringToField->end())
       return i->second;
 
    int result = sgFieldToStringSize;
-   (*sgStringToField)[f] = result;
+   (*sgStringToField)[std::string(inFieldName)] = result;
    String str(inFieldName,strlen(inFieldName));
 
    // Make into "const" string that will not get collected...
@@ -949,9 +1092,16 @@ unsigned char *__hxcpp_memory = 0;
 
 void  __hxcpp_memory_memset(Array<unsigned char> &inBuffer ,int pos, int len, int value)
 {
+   // Clamp the start - a negative pos would write before the buffer
+   if (pos<0)
+   {
+      len += pos;
+      pos = 0;
+   }
    if (pos<inBuffer->length)
    {
-      if (pos+len>inBuffer->length)
+      // Overflow-safe upper clamp
+      if (len > inBuffer->length - pos)
          len = inBuffer->length - pos;
       if (len>0)
          memset( inBuffer->Pointer() + pos, value, len);

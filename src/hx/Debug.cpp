@@ -47,9 +47,13 @@ namespace hx
 const char* EXTERN_CLASS_NAME = "extern";
 
 #ifdef HXCPP_STACK_IDS
-static std::mutex sStackMapMutex;
 typedef std::unordered_map<int, StackContext *> StackMap;
-static StackMap sStackMap;
+// Never destroyed: a thread leaves the map as it ends, and a thread can end
+// while the main thread, having returned from main, runs the static
+// destructors. A static map was destroyed under it, and the erase faulted;
+// a static mutex, destroyed the same way, makes libc++ throw and abort.
+static std::mutex &sStackMapMutex = *new std::mutex();
+static StackMap &sStackMap = *new StackMap();
 #endif
 
 // User settable String->Void
@@ -60,7 +64,7 @@ static Dynamic sCriticalErrorHandler;
 
 static void setStaticHandler(Dynamic &inStore, Dynamic inValue)
 {
-   if ( inStore==null() != inValue==null())
+   if ( (inStore==null()) != (inValue==null()) )
    {
       if ( inValue!=null() )
          GCAddRoot(&inStore.mPtr);
@@ -94,8 +98,14 @@ static void CriticalErrorHandler(String inErr, bool allowFixup)
     DBGLOG("Critical Error: %s\n", inErr.utf8_str());
 
 #if defined(HX_WINDOWS) && !defined(HX_WINRT)
-    MessageBoxA(0, inErr.utf8_str(), "Critical Error - program must terminate",
-        MB_ICONEXCLAMATION|MB_OK);
+    // Looked up here rather than imported, since importing user32 makes
+    // every program load it at startup, which costs about a millisecond
+    typedef int (WINAPI *MessageBoxFunc)(HWND, LPCSTR, LPCSTR, UINT);
+    HMODULE user32 = LoadLibraryA("user32.dll");
+    MessageBoxFunc messageBox = user32 ? (MessageBoxFunc)GetProcAddress(user32, "MessageBoxA") : 0;
+    if (messageBox)
+       messageBox(0, inErr.utf8_str(), "Critical Error - program must terminate",
+           MB_ICONEXCLAMATION|MB_OK);
 #endif
 
     // Good when using gdb, and to collect a core ...
@@ -192,6 +202,7 @@ StackContext::StackContext()
 {
    #ifdef HXCPP_STACK_TRACE
    mIsUnwindingException = false;
+   mUnwindResumeDepth = -1;
    #endif
 
    #if HXCPP_TELEMETRY
@@ -208,6 +219,8 @@ StackContext::StackContext()
 
    #ifdef HXCPP_SCRIPTABLE
    stack = new unsigned char[128*1024];
+   // Leave a 16K margin - argument pushes precede the callee's frame check
+   stackEnd = stack + 128*1024 - 16*1024;
    pointer = &stack[0];
    push((hx::Object *)0);
    frame = pointer;

@@ -8,6 +8,7 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <unordered_map>
 #include <set>
 
 #ifdef HX_ANDROID
@@ -57,11 +58,6 @@ struct ScriptCallable;
 class  ScriptRegistered;
 class  HaxeNativeClass;
 class  HaxeNativeInterface;
-
-// Format a message to throw.
-const char *cppiaError(const char *inFormat, ...);
-// Same, with the haxe source position of the expression appended.
-const char *cppiaExprError(CppiaExpr *e, const char *inFormat, ...);
 
 enum CppiaOp
 {
@@ -157,12 +153,21 @@ extern int gArrayArgCount[];
 typedef std::map<int,CppiaStackVar *> CppiaStackVarMap;
 
 extern String sInvalidArgCount;
-extern String sUnloadedMessage;
 
-void _hx_cppia_track_expr(void *inExpr);
-void _hx_cppia_untrack_expr(void *inExpr);
+// Native objects a module creates while it loads come from its arena and go when it is freed.
+// Deleting one runs its destructor; its memory stays with the module.
+void *cppiaAlloc(size_t inSize, void (*inDestroy)(void *));
+void cppiaFree(void *inPtr);
 
-struct CppiaExpr
+template<typename T>
+struct CppiaOwned
+{
+   static void destroy(void *inPtr) { static_cast<T *>(inPtr)->~T(); }
+   static void *operator new(size_t inSize) { return cppiaAlloc(inSize, destroy); }
+   static void operator delete(void *inPtr) { cppiaFree(inPtr); }
+};
+
+struct CppiaExpr : public CppiaOwned<CppiaExpr>
 {
    int line;
    const char *filename;
@@ -170,18 +175,6 @@ struct CppiaExpr
    const char *functionName;
    int haxeTypeId;
 
-   void *operator new(size_t inSize)
-   {
-      void *result = ::operator new(inSize);
-      _hx_cppia_track_expr(result);
-      return result;
-   }
-
-   void operator delete(void *inPtr)
-   {
-      _hx_cppia_untrack_expr(inPtr);
-      ::operator delete(inPtr);
-   }
 
    CppiaExpr() : line(0), filename(0), className(0), functionName(0)
    {
@@ -205,6 +198,12 @@ struct CppiaExpr
    virtual void mark(hx::MarkContext *ctx) { };
    virtual void visit(hx::VisitContext *ctx) { };
    virtual bool isBoolInt() { return false; }
+   // The line the debugger first sees when this runs as a function body
+   virtual int firstLine() { return line; }
+
+   // Constant-folding query - lets containers (eg, switch) build dispatch
+   // tables at link time when every alternative is a literal int
+   virtual bool getConstantInt(int &outValue) { return false; }
 
 
    virtual ExprType    getType() { return etObject; }
@@ -281,6 +280,7 @@ struct ScriptCallable : public CppiaDynamicExpr
 {
    int returnTypeId;
    ExprType returnType;
+   bool isBoolReturn;
    int argCount;
    int stackSize;
    bool hasDefaults;
@@ -290,8 +290,11 @@ struct ScriptCallable : public CppiaDynamicExpr
    std::vector<CppiaConst>    initVals;
    CppiaExpr *body;
    CppiaModule *data;
+   // Static functions and main store their module in the frame's this slot, so running code keeps it
+   bool staticEntry;
    #ifdef CPPIA_JIT
    CppiaFunc compiled;
+   bool ownsCompiled;
    #endif
 
    #ifdef HXCPP_STACK_SCRIPTABLE
@@ -303,8 +306,6 @@ struct ScriptCallable : public CppiaDynamicExpr
    std::vector<CppiaStackVar *> captureVars;
    int                          captureSize;
 
-
-   void deactivate();
 
    ScriptCallable(CppiaStream &stream);
    ScriptCallable(CppiaExpr *inBody);
@@ -327,6 +328,13 @@ struct ScriptCallable : public CppiaDynamicExpr
    #ifdef CPPIA_JIT
    void compile();
    void genDefaults(CppiaCompiler *compiler);
+   #ifdef HXCPP_DEBUGGER
+   void genZeroLocals(CppiaCompiler *compiler);
+   #endif
+   void genModuleAnchor(CppiaCompiler *compiler);
+   #ifdef HXCPP_STACK_TRACE
+   void genPushFrame(CppiaCompiler *compiler, int frameLocal);
+   #endif
    void genArgs(CppiaCompiler *compiler, CppiaExpr *inThis, Expressions &inArgs, const JitVal &inThisVal);
    void genCode(CppiaCompiler *compiler,const JitVal &inDest=JitVal(),ExprType type=etNull) HXCPP_OVERRIDE;
    #endif
@@ -363,7 +371,7 @@ hx::Object *createEnumClosure(struct CppiaEnumConstructor &inContructor);
 hx::Object *DynamicToArrayType(hx::Object *obj, ArrayType arrayType);
 
 
-struct TypeData
+struct TypeData : public CppiaOwned<TypeData>
 {
    String              name;
    hx::Class           haxeClass;
@@ -395,12 +403,9 @@ public:
    std::vector< TypeData * >       types;
    std::vector< CppiaClassInfo * > classes;
    std::vector< CppiaExpr * >      markable;
-
-   std::unordered_set< CppiaExpr * > allExprs;
-   std::unordered_set<int>         allFileIds;
-
+   std::unordered_set<int>           allFileIds;
    typedef std::map< std::string, int > InterfaceSlots;
-   static InterfaceSlots                interfaceSlots;
+   InterfaceSlots                  interfaceSlots;
 
    StackLayout                     *layout;
    CppiaClassInfo                  *linkingClass;
@@ -409,19 +414,27 @@ public:
    int                             scriptId;
 
    ScriptCallable                  *main;
+   std::vector< hx::Resource >     resources;
 
-   bool                            unloaded;
+   // The module's CppiaObject: what keeps it alive once released
+   hx::Object                      *owner;
+   bool                            released;
+
+   struct ArenaChunk { char *base; size_t size; size_t used; };
+   std::vector<ArenaChunk>         arena;
 
    CppiaModule();
    ~CppiaModule();
 
-   void unload();
+   void *arenaAlloc(size_t inSize);
+   bool ownsMemory(const void *inPtr) const;
+   void release();
+
    void link();
    void compile();
    void setDebug(CppiaExpr *outExpr, int inFileId, int inLine);
    void boot(CppiaCtx *ctx);
    void where(CppiaExpr *e);
-   const char *linkError(CppiaExpr *e, const char *inKind, const char *inClass, const char *inField);
    void mark(hx::MarkContext *ctx);
    void visit(hx::VisitContext *ctx);
    int  getInterfaceSlot(const std::string &inName);
@@ -458,7 +471,7 @@ struct ArgInfo
 };
 
 
-struct CppiaFunction
+struct CppiaFunction : public CppiaOwned<CppiaFunction>
 {
    CppiaModule          &cppia;
    int                  nameId;
@@ -483,7 +496,7 @@ struct CppiaFunction
 
 
 
-struct CppiaStackVar
+struct CppiaStackVar : public CppiaOwned<CppiaStackVar>
 {
    int      nameId;
    int      id;
@@ -529,7 +542,9 @@ void LinkExpressions(Expressions &ioExpressions, CppiaModule &data);
 
 CppiaExpr *createEnumField(CppiaStream &stream,bool inWithArgs);
 
-struct CppiaVar
+void AlignOffset(ExprType type, int &ioOffset);
+
+struct CppiaVar : public CppiaOwned<CppiaVar>
 {
    enum Access { accNormal, accNo, accResolve, accCall, accRequire, accCallNative } ;
 
@@ -542,8 +557,6 @@ struct CppiaVar
    int              typeId;
    int              offset;
    String           name;
-   // If using live modules, this is the module that owns this variable.
-   CppiaModule      *owner;
    FieldStorage     storeType;
    CppiaFunction    *dynamicFunction;
    ExprType         exprType;
@@ -664,7 +677,7 @@ void runFunExprDynamicVoid(CppiaCtx *ctx, ScriptCallable *inFunExpr, hx::Object 
 hx::Class_obj *createCppiaClass(CppiaClassInfo *);
 
 
-class CppiaClassInfo
+class CppiaClassInfo : public CppiaOwned<CppiaClassInfo>
 {
 public:
 
@@ -682,14 +695,12 @@ public:
    bool      containsPointers;
    int       dynamicMapOffset;
    int       interfaceSlotSize;
-   int       vtableSlotCount;
-   int       hostVTableSlots;
-   bool      unloaded;
    void      **vtable;
-   std::vector<void **> superVtables;
    std::string name;
    std::map<int, void *> interfaceScriptTables;
    std::vector<ScriptNamedFunction *> nativeInterfaceFunctions;
+   // Fill host interface slots whose signature differs from the script function
+   std::vector<ScriptCallable *> interfaceAdapters;
    std::set<String> nativeProperties;
    hx::Class     mClass;
 
@@ -701,6 +712,17 @@ public:
    FunctionMap memberSetters;
    std::vector<CppiaVar *> memberVars;
    std::vector<CppiaVar *> dynamicFunctions;
+
+   // One-probe member lookup built at link time - getField/setField
+   // previously scanned functions, dynamic functions and vars linearly
+   // with a string compare per entry on every dynamic access.  Keys are
+   // the module's permanent strings, so they are GC-safe to hold here.
+   enum MemberFieldKind { mfFunction, mfDynamicFunction, mfVar };
+   struct MemberFieldEntry { int kind; void *ptr; };
+   struct MemberNameHash { size_t operator()(const String &inS) const { return inS.hash(); } };
+   struct MemberNameEq { bool operator()(const String &inA, const String &inB) const { return inA==inB; } };
+   typedef std::unordered_map<String,MemberFieldEntry,MemberNameHash,MemberNameEq> MemberFieldLookup;
+   MemberFieldLookup memberFieldLookup;
 
    Functions staticFunctions;
    FunctionMap staticGetters;
@@ -740,14 +762,13 @@ public:
 
    void link();
    void linkTypes();
-   void deactivate();
 
 
    inline bool isNativeProperty(const String &inString);
    int __GetType();
    int getEnumIndex(String inName);
    bool implementsInterface(CppiaClassInfo *inInterface);
-   ScriptCallable *findFunction(bool inStatic,int inId, CppiaModule &inFrom);
+   ScriptCallable *findFunction(bool inStatic,int inId);
    ScriptCallable *findInterfaceFunction(const std::string &inName);
    ScriptCallable *findFunction(bool inStatic, const String &inName);
    ScriptCallable *findFunction(FunctionMap &inMap,const String &inName);
@@ -759,17 +780,14 @@ public:
       { return findFunction(staticGetters,inName); }
    inline ScriptCallable *findStaticSetter(const String &inName)
       { return findFunction(staticSetters,inName); }
-   CppiaEnumConstructor *findEnum(int inFieldId, CppiaModule &inFrom);
+   CppiaEnumConstructor *findEnum(int inFieldId);
    ExprType findFunctionType(CppiaModule &inModule, int inName);
-   CppiaFunction *findVTableFunction(int inId, CppiaModule &inFrom);
-   int findFunctionSlot(int inName, CppiaModule &inFrom);
-   CppiaVar *findVar(bool inStatic,int inId, CppiaModule &inFrom);
-   int importType(CppiaModule &inFrom, int inTypeId);
+   CppiaFunction *findVTableFunction(int inId);
+   int findFunctionSlot(int inName);
+   CppiaVar *findVar(bool inStatic,int inId);
 
    void *getHaxeBaseVTable();
    int getScriptVTableOffset();
-   void **getSuperVTable(int inSlot);
-   void freeSuperVTables();
 
    Dynamic getStaticValue(const String &inName,hx::PropertyAccess  inCallProp);
    bool hasStaticValue(const String &inName);
@@ -786,6 +804,7 @@ public:
 
    void mark(hx::MarkContext *__inCtx);
    void markInstance(hx::Object *inThis, hx::MarkContext *__inCtx);
+   void release();
 
    #ifdef HXCPP_VISIT_ALLOCS
    void visit(hx::VisitContext *__inCtx);
@@ -809,7 +828,7 @@ public:
    #ifdef HXCPP_DEBUGGER
       #define CPPIA_STACK_LINE(expr) \
           ctx->getCurrentStackFrame()->lineNumber = expr->line; \
-          if (hx::gShouldCallHandleBreakpoints) \
+          if (hx::gShouldCallHandleBreakpoints.load(std::memory_order_relaxed)) \
               __hxcpp_on_line_changed(ctx);
    #else
       #define CPPIA_STACK_LINE(expr) ctx->getCurrentStackFrame()->lineNumber = expr->line;
@@ -823,12 +842,16 @@ public:
    {
       hx::StackContext *ctx;
       hx::StackFrame *frame;
+      // The script stack only keeps 4-byte alignment
+      alignas(hx::StackFrame) unsigned char storage[sizeof(hx::StackFrame)];
       CppiaStackFrame(hx::StackContext *inCtx, hx::StackPosition *inPosition)
       {
          ctx = inCtx;
-         frame = (hx::StackFrame *)ctx->stackAlloc(sizeof(hx::StackFrame));
+         frame = (hx::StackFrame *)storage;
          frame->position = inPosition;
-         frame->lineNumber = 0;
+         #ifdef HXCPP_STACK_SCRIPTABLE
+         frame->scriptStack = ctx->pointer;
+         #endif
          #ifdef HXCPP_DEBUGGER
          frame->variables = 0;
          frame->catchables = 0;
@@ -986,8 +1009,21 @@ template<> struct ExprTypeOf<int> { enum { value = etInt }; };
 template<> struct ExprTypeOf<unsigned char> { enum { value = etInt }; };
 template<> struct ExprTypeOf<bool> { enum { value = etInt }; };
 template<> struct ExprTypeOf<Float> { enum { value = etFloat }; };
+template<> struct ExprTypeOf<float> { enum { value = etFloat }; };
 template<> struct ExprTypeOf<String> { enum { value = etString }; };
 
+
+#ifdef CPPIA_JIT
+void genNullReferenceExceptionCheck(CppiaCompiler *compiler, const JitVal &reg);
+
+// Loads the object a field holds when the code runs. A moving collection
+// updates the field, while an address written into the code would go stale.
+inline void genLoadHeldObject(CppiaCompiler *compiler, const JitVal &inDest, hx::Object **inHolder)
+{
+   compiler->move( sJitTemp0, JitVal( (void *)inHolder ) );
+   compiler->move( inDest, sJitTemp0.star(jtPointer,0) );
+}
+#endif
 
 template<typename T>
 struct ExprTypeIsBool { enum { value = false }; };

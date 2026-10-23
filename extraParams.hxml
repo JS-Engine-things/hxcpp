@@ -1,0 +1,2 @@
+--macro haxe.macro.Compiler.define("libhxcpp","6.0.0")
+--macro haxe.macro.Compiler.define("hxcpp","6.0.0")

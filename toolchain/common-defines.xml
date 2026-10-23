@@ -21,6 +21,13 @@
  <flag value="-DHXCPP_GC_BIG_BLOCKS" if="HXCPP_GC_BIG_BLOCKS" tag="gc" />
  <flag value="-DHXCPP_GC_SUMMARY" if="HXCPP_GC_SUMMARY" tag="gc" />
  <flag value="-DHXCPP_GC_DYNAMIC_SIZE" if="HXCPP_GC_DYNAMIC_SIZE" tag="gc" />
+ <!-- GC debugging aids, which otherwise meant editing Immix.cpp -->
+ <flag value="-DSHOW_MEM_EVENTS" if="HXCPP_GC_SHOW_MEM_EVENTS" tag="gc" />
+ <flag value="-DSHOW_FRAGMENTATION" if="HXCPP_GC_SHOW_FRAGMENTATION" tag="gc" />
+ <flag value="-DPROFILE_COLLECT" if="HXCPP_GC_PROFILE_COLLECT" tag="gc" />
+ <flag value="-DHX_GC_FIXED_BLOCKS" if="HXCPP_GC_FIXED_BLOCKS" tag="gc" />
+ <flag value="-DHX_WATCH" if="HXCPP_GC_WATCH" tag="gc" />
+ <flag value="-DHX_WATCH_ADDRESS=${HXCPP_GC_WATCH}" if="HXCPP_GC_WATCH" tag="gc" />
  <flag value="-DHXCPP_GC_CHECK_POINTER" if="HXCPP_GC_CHECK_POINTER" tag="haxe" />
  <flag value="-DHXCPP_GC_DEBUG_ALWAYS_MOVE" if="HXCPP_GC_DEBUG_ALWAYS_MOVE" tag="haxe" />
  <flag value="-DHXCPP_GC_GENERATIONAL" if="HXCPP_GC_GENERATIONAL" tag="haxe" />
@@ -43,6 +50,14 @@
  <flag value="-DHXCPP_GC_MOVING" if="HXCPP_GC_MOVING" tag="haxe" />
  <flag value="-DHXCPP_GC_GENERATIONAL" if="HXCPP_GC_GENERATIONAL" tag="haxe" />
 
+ <!-- A Haxe Int wraps on overflow, as every other target's does, and the
+      generated code relies on it: hashes, random generators, checksums,
+      haxe.crypto. In C++ a signed overflow is undefined rather than a wrap,
+      and gcc and clang optimise on that. -fwrapv makes it the wrap. Measured
+      with gcc 13 on CRC32, Adler-32, DEFLATE, MD5, SHA-256, a hash mix and
+      map lookups: no change. MSVC has no such flag. -->
+ <flag value="-fwrapv" unless="isMsvc" tag="haxe" />
+
  <!-- tracy features  -->
  <flag value='-DHXCPP_TRACY' if="HXCPP_TRACY" tag="haxe"/>
  <flag value='-DHXCPP_TRACY_MEMORY' if="HXCPP_TRACY_MEMORY" tag="haxe"/>
@@ -50,6 +65,7 @@
  <flag value='-DHXCPP_TRACY_ON_DEMAND' if="HXCPP_TRACY_ON_DEMAND" tag="haxe"/>
  <flag value='-DHXCPP_TRACY_INCLUDE_CALLSTACKS' if="HXCPP_TRACY_INCLUDE_CALLSTACKS" tag="haxe"/>
  <flag value='-DHXCPP_TRACY_MAX_ZONE_DEPTH=${HXCPP_TRACY_MAX_ZONE_DEPTH}' if="HXCPP_TRACY_MAX_ZONE_DEPTH" tag="haxe"/>
+ <flag value='-DTRACY_TIMER_FALLBACK' if="HXCPP_TRACY_TIMER_FALLBACK" tag="haxe"/>
 
  <mmflag value='-Wno-invalid-offsetof' />
  <mmflag value='-Wno-format-security' />

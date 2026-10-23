@@ -8,6 +8,29 @@
 
 #define PCRE(o)      ((pcredata*)o.mPtr)
 
+// The PCRE2 JIT is opt-in (-D HXCPP_PCRE_JIT, see Build.xml).  Jitted code
+// runs on a small fixed stack, so a long subject can fail with
+// PCRE2_ERROR_JIT_STACKLIMIT where the interpreter succeeds; such a match is
+// run again by the interpreter, so turning the JIT on never changes a result.
+template<typename CODE>
+static inline void regexp_jit_compile(CODE *inCode, int (*inCompile)(CODE *, uint32_t))
+{
+   #ifdef HXCPP_PCRE_JIT
+   // Best effort - matching falls back to the interpreter when jit
+   // compilation is unavailable or fails
+   inCompile(inCode, PCRE2_JIT_COMPLETE);
+   #endif
+}
+
+static inline bool regexp_retry_without_jit(int inResult)
+{
+   #ifdef HXCPP_PCRE_JIT
+   return inResult==PCRE2_ERROR_JIT_STACKLIMIT;
+   #else
+   return false;
+   #endif
+}
+
 static void regexp_compilation_error(String pattern, int error_code, size_t error_offset) {
    PCRE2_UCHAR8 error_buffer[128];
    pcre2_get_error_message_8(error_code, error_buffer, sizeof(error_buffer));
@@ -32,6 +55,61 @@ struct pcredata : public hx::Object
    unsigned int flags;
    String string;
    String expr;
+
+   #ifdef HX_SMART_STRINGS
+   // The last utf16 subject, and the same text as valid utf16.  Haxe strings
+   // may hold lone surrogates, which pcre2 must not be given with
+   // PCRE2_NO_UTF_CHECK, but letting it check made global matching
+   // quadratic: every call checks from its start position to the end.  So
+   // each subject is checked here once.  A valid one is matched as it is;
+   // one with lone surrogates through a copy with U+FFFD in their place,
+   // which has the same length, so the match positions apply to the
+   // original.  Holding the subject keeps its buffer from being reused
+   // while it is remembered.
+   String checkedSubject;
+   String safeSubject;
+
+   const char16_t *utf16Subject(const String &inString)
+   {
+      if (inString.raw_wptr()!=checkedSubject.raw_wptr() || inString.length!=checkedSubject.length)
+      {
+         int len = inString.length;
+         int bad = -1;
+         const char16_t *w = inString.raw_wptr();
+         for(int i=0;i<len && bad<0;i++)
+         {
+            char16_t c = w[i];
+            if (c>=0xd800 && c<=0xdbff && i+1<len && w[i+1]>=0xdc00 && w[i+1]<=0xdfff)
+               i++;
+            else if (c>=0xd800 && c<=0xdfff)
+               bad = i;
+         }
+
+         checkedSubject = inString;
+         HX_OBJ_WB_GET(this, checkedSubject.raw_ref());
+         if (bad<0)
+            safeSubject = inString;
+         else
+         {
+            char16_t *copy = String::allocChar16Ptr(len);
+            // Read the source again - the allocation may have moved it
+            w = inString.raw_wptr();
+            memcpy(copy, w, len*sizeof(char16_t));
+            for(int i=bad;i<len;i++)
+            {
+               char16_t c = copy[i];
+               if (c>=0xd800 && c<=0xdbff && i+1<len && copy[i+1]>=0xdc00 && copy[i+1]<=0xdfff)
+                  i++;
+               else if (c>=0xd800 && c<=0xdfff)
+                  copy[i] = 0xfffd;
+            }
+            safeSubject = String(copy, len);
+         }
+         HX_OBJ_WB_GET(this, safeSubject.raw_ref());
+      }
+      return safeSubject.raw_wptr();
+   }
+   #endif
 
    void create8(pcre2_code_8 *inR, String inExpr, int inFlags)
    {
@@ -73,6 +151,19 @@ struct pcredata : public hx::Object
    }
    #endif
 
+   // A negative pcre2_match result is only "no match" for NOMATCH itself -
+   // the other codes (match limit exceeded, invalid utf, ...) are genuine
+   // errors and silently treating them as no-match returns wrong answers
+   static bool checkMatch(int n)
+   {
+      if (n>=0)
+         return true;
+      if (n==PCRE2_ERROR_NOMATCH)
+         return false;
+      hx::Throw( HX_CSTRING("Regexp match error ") + String(n) );
+      return false;
+   }
+
    bool run(String string,int pos,int len)
    {
       #ifdef HX_SMART_STRINGS
@@ -85,15 +176,20 @@ struct pcredata : public hx::Object
             hx::strbuf buf;
             int utf16Length = 0;
             PCRE2_SPTR16 utf16 = (PCRE2_SPTR16)expr.wc_str(&buf, &utf16Length);
-            rUtf16 = pcre2_compile_16((PCRE2_SPTR16)expr.wc_str(&buf),utf16Length,flags,&error_code,&error_offset,NULL);
+            rUtf16 = pcre2_compile_16(utf16,utf16Length,flags,&error_code,&error_offset,NULL);
             if (!rUtf16) {
                regexp_compilation_error(expr,error_code,error_offset);
             }
+            regexp_jit_compile(rUtf16, pcre2_jit_compile_16);
             match_data16 = pcre2_match_data_create_from_pattern_16(rUtf16, NULL);
          }
 
-         int n = pcre2_match_16(rUtf16,(PCRE2_SPTR16)string.raw_wptr(),pos+len,pos,PCRE2_NO_UTF_CHECK,match_data16,NULL);
-         return n>=0;
+         // Valid utf16 (see utf16Subject), so PCRE2_NO_UTF_CHECK is safe
+         PCRE2_SPTR16 subject = (PCRE2_SPTR16)utf16Subject(string);
+         int n = pcre2_match_16(rUtf16,subject,pos+len,pos,PCRE2_NO_UTF_CHECK,match_data16,NULL);
+         if (regexp_retry_without_jit(n))
+            n = pcre2_match_16(rUtf16,subject,pos+len,pos,PCRE2_NO_UTF_CHECK|PCRE2_NO_JIT,match_data16,NULL);
+         return checkMatch(n);
       }
 
       if (!rUtf8)
@@ -106,11 +202,24 @@ struct pcredata : public hx::Object
          if (!rUtf8) {
             regexp_compilation_error(expr,error_code,error_offset);
          }
+         regexp_jit_compile(rUtf8, pcre2_jit_compile_8);
          match_data8 = pcre2_match_data_create_from_pattern_8(rUtf8, NULL);
       }
 
+      // The remembered UTF-16 subject belongs to an earlier match
+      if (checkedSubject.raw_ptr())
+      {
+         checkedSubject = String();
+         safeSubject = String();
+      }
       #endif
-      return pcre2_match_8(rUtf8,(PCRE2_SPTR8)string.utf8_str(),pos+len,pos,PCRE2_NO_UTF_CHECK,match_data8,NULL) >= 0;
+      // The 8-bit subject comes from utf8_str(), which validates, so
+      // PCRE2_NO_UTF_CHECK is safe here
+      PCRE2_SPTR8 subject = (PCRE2_SPTR8)string.utf8_str();
+      int n = pcre2_match_8(rUtf8,subject,pos+len,pos,PCRE2_NO_UTF_CHECK,match_data8,NULL);
+      if (regexp_retry_without_jit(n))
+         n = pcre2_match_8(rUtf8,subject,pos+len,pos,PCRE2_NO_UTF_CHECK|PCRE2_NO_JIT,match_data8,NULL);
+      return checkMatch(n);
    }
 
    size_t* get_matches() {
@@ -133,9 +242,25 @@ struct pcredata : public hx::Object
       #endif
    }
 
-   void __Mark(hx::MarkContext *__inCtx) HXCPP_OVERRIDE { HX_MARK_MEMBER(string); HX_MARK_MEMBER(expr); }
+   void __Mark(hx::MarkContext *__inCtx) HXCPP_OVERRIDE
+   {
+      HX_MARK_MEMBER(string);
+      HX_MARK_MEMBER(expr);
+      #ifdef HX_SMART_STRINGS
+      HX_MARK_MEMBER(checkedSubject);
+      HX_MARK_MEMBER(safeSubject);
+      #endif
+   }
    #ifdef HXCPP_VISIT_ALLOCS
-   void __Visit(hx::VisitContext *__inCtx) HXCPP_OVERRIDE { HX_VISIT_MEMBER(string); HX_VISIT_MEMBER(expr); }
+   void __Visit(hx::VisitContext *__inCtx) HXCPP_OVERRIDE
+   {
+      HX_VISIT_MEMBER(string);
+      HX_VISIT_MEMBER(expr);
+      #ifdef HX_SMART_STRINGS
+      HX_VISIT_MEMBER(checkedSubject);
+      HX_VISIT_MEMBER(safeSubject);
+      #endif
+   }
    #endif
 
    static void finalize(Dynamic obj)
@@ -198,7 +323,7 @@ Dynamic _hx_regexp_new_options(String s, String opt)
       if( !p ) {
          regexp_compilation_error(s,error_code,error_offset);
       }
-
+      regexp_jit_compile(p, pcre2_jit_compile_16);
       pcredata *pdata = new pcredata;
       pdata->create16(p,s,options);
       return pdata;
@@ -212,7 +337,7 @@ Dynamic _hx_regexp_new_options(String s, String opt)
       if( !p ) {
          regexp_compilation_error(s,error_code,error_offset);
       }
-
+      regexp_jit_compile(p, pcre2_jit_compile_8);
       pcredata *pdata = new pcredata;
       pdata->create8(p,s,options);
       return pdata;
@@ -221,7 +346,8 @@ Dynamic _hx_regexp_new_options(String s, String opt)
 
 bool _hx_regexp_match(Dynamic handle, String string, int pos, int len)
 {
-   if( pos < 0 || len < 0 || pos > string.length || pos + len > string.length )
+   // Overflow-safe bounds - pos+len can wrap for huge len
+   if( pos < 0 || len < 0 || pos > string.length || len > string.length - pos )
       return false;
 
    pcredata *d = PCRE(handle);

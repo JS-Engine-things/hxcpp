@@ -2,6 +2,8 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
+#include <float.h>
 #include <set>
 #include <string>
 #include "hx/Hash.h"
@@ -40,18 +42,123 @@ using namespace hx;
 #include "hx/Unicase.h"
 #endif
 
+// ---- Locale-independent numeric conversion --------------------------------
+// The process locale is global mutable state that host frameworks (GUI
+// toolkits, audio libraries, JNI containers) change after boot.  A
+// comma-decimal locale flips strtod/printf's separator, breaking float
+// parsing and printing.  Parse and print through an explicit "C" numeric
+// locale where the platform provides one.
+#ifndef HX_WINDOWS
+#include <locale.h>
+#ifdef __APPLE__
+#include <xlocale.h>
+#endif
+#endif
+
+#if defined(HX_WINDOWS) && !defined(HX_WINRT)
+
+static _locale_t hxCNumericLocale()
+{
+   static _locale_t cLoc = _create_locale(LC_NUMERIC, "C");
+   return cLoc;
+}
+static double hxStrtodC(const char *inStr, char **outEnd)
+{
+   return _strtod_l(inStr, outEnd, hxCNumericLocale());
+}
+struct HxCNumericScope { };
+#define HX_SNPRINTF_C(buf,len,fmt,...) _snprintf_l(buf,len,fmt,hxCNumericLocale(),__VA_ARGS__)
+
+#elif defined(__APPLE__) || defined(__GLIBC__) || (defined(__ANDROID_API__) && __ANDROID_API__>=21)
+
+static locale_t hxCNumericLocale()
+{
+   static locale_t cLoc = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+   return cLoc;
+}
+static double hxStrtodC(const char *inStr, char **outEnd)
+{
+   locale_t old = uselocale(hxCNumericLocale());
+   double result = strtod(inStr, outEnd);
+   uselocale(old);
+   return result;
+}
+// Switches this thread to the "C" numeric locale for the printf calls in
+// its scope
+struct HxCNumericScope
+{
+   locale_t old;
+   HxCNumericScope() { old = uselocale(hxCNumericLocale()); }
+   ~HxCNumericScope() { uselocale(old); }
+};
+#define HX_SNPRINTF_C SPRINTF
+
+#else
+
+static double hxStrtodC(const char *inStr, char **outEnd)
+{
+   return strtod(inStr, outEnd);
+}
+struct HxCNumericScope { };
+#define HX_SNPRINTF_C SPRINTF
+
+#endif
+
+// Locale-independent double parse for other runtime modules (cppia
+// constant loading etc)
+double _hx_strtod_c_locale(const char *inStr)
+{
+   return hxStrtodC(inStr, 0);
+}
+
 namespace hx
 {
 char HX_DOUBLE_PATTERN[20] = "%.15g";
+bool HX_DOUBLE_PATTERN_CUSTOM = false;
 #define HX_INT_PATTERN "%d"
 #define HX_UINT_PATTERN "%ud"
 }
 
+// The pattern is given to snprintf with one double, so it may hold exactly one
+// floating-point conversion, %[flags][width][.precision] then e, f, g or a in
+// either case, and no other conversion that would read an argument
+static bool isFloatFormat(const char *inFormat)
+{
+   int conversions = 0;
+   for(const char *p = inFormat; *p; p++)
+   {
+      if (*p!='%')
+         continue;
+      p++;
+      if (*p=='%')
+         continue;
+      while(*p && strchr("-+ #0",*p))
+         p++;
+      while(*p>='0' && *p<='9')
+         p++;
+      if (*p=='.')
+      {
+         p++;
+         while(*p>='0' && *p<='9')
+            p++;
+      }
+      if (!*p || !strchr("eEfFgGaA",*p))
+         return false;
+      conversions++;
+   }
+   return conversions==1;
+}
+
 void __hxcpp_set_float_format(String inFormat)
 {
+  char pattern[20];
   int last = inFormat.length < 19 ? inFormat.length : 19;
-  memcpy(HX_DOUBLE_PATTERN, inFormat.utf8_str(), last*sizeof(char) );
-  HX_DOUBLE_PATTERN[last] = '\0';
+  memcpy(pattern, inFormat.utf8_str(), last*sizeof(char) );
+  pattern[last] = '\0';
+  if (!isFloatFormat(pattern))
+     hx::Throw( HX_CSTRING("set_float_format: the format must hold one floating-point conversion, such as %.6g, and no other") );
+  memcpy(HX_DOUBLE_PATTERN, pattern, sizeof(pattern));
+  hx::HX_DOUBLE_PATTERN_CUSTOM = true;
 }
 
 // --- GC helper
@@ -68,6 +175,7 @@ static String *sCharToString[1088] = { 0 };
 typedef Hash<TNonGcStringSet> StringSet;
 static StringSet *sPermanentStringSet = 0;
 static volatile int sPermanentStringSetMutex = 0;
+static volatile int sCharToStringMutex = 0;
 
 #ifdef HXCPP_COMBINE_STRINGS
 static bool sIsIdent[256];
@@ -153,48 +261,60 @@ static const unsigned char *getUtf8LenArray()
 }
 #endif
 
-static inline int DecodeAdvanceUTF8(const unsigned char * &ioPtr)
-{
-   int c = *ioPtr++;
-   if( c < 0x80 )
-   {
-      return c;
-   }
-   else if( c < 0xE0 )
-   {
-      return ((c & 0x3F) << 6) | ((*ioPtr++) & 0x7F);
-   }
-   else if( c < 0xF0 )
-   {
-      int c2 = *ioPtr++;
-      return  ((c & 0x1F) << 12) | ((c2 & 0x7F) << 6) | ( (*ioPtr++) & 0x7F);
-   }
-
-   int c2 = *ioPtr++;
-   int c3 = *ioPtr++;
-   return ((c & 0x0F) << 18) | ((c2 & 0x7F) << 12) | ((c3 & 0x7F) << 6) | ((*ioPtr++) & 0x7F);
-}
-
+// Each maximal invalid subsequence (stray or missing continuation bytes,
+// overlong forms, surrogates, values above U+10FFFF) becomes one U+FFFD.
+// Without an end, decoding stops at the NUL terminator, which is never a
+// continuation byte.
 static inline int DecodeAdvanceUTF8(const unsigned char * &ioPtr,const unsigned char *end)
 {
-   int c = *ioPtr++;
-   if( c < 0x80 )
-   {
-      return c;
-   }
-   else if( c < 0xE0 )
-   {
-      return ((c & 0x3F) << 6) | (ioPtr < end ? (*ioPtr++) & 0x7F : 0);
-   }
-   else if( c < 0xF0 )
-   {
-      int c2 = ioPtr<end ? *ioPtr++ : 0;
-      return  ((c & 0x1F) << 12) | ((c2 & 0x7F) << 6) | ( ioPtr<end ? (*ioPtr++) & 0x7F : 0 );
-   }
+   int lead = *ioPtr++;
+   if( lead < 0x80 )
+      return lead;
 
-   int c2 = ioPtr<end ? *ioPtr++ : 0;
-   int c3 = ioPtr<end ? *ioPtr++ : 0;
-   return ((c & 0x0F) << 18) | ((c2 & 0x7F) << 12) | ((c3 & 0x7F) << 6) | ( ioPtr<end ? (*ioPtr++) & 0x7F : 0);
+   int code;
+   int more;
+   int lo = 0x80;
+   int hi = 0xBF;
+   if( lead >= 0xC2 && lead <= 0xDF )
+   {
+      code = lead & 0x1F;
+      more = 1;
+   }
+   else if( lead >= 0xE0 && lead <= 0xEF )
+   {
+      code = lead & 0x0F;
+      more = 2;
+      if (lead==0xE0) lo = 0xA0;
+      else if (lead==0xED) hi = 0x9F;
+   }
+   else if( lead >= 0xF0 && lead <= 0xF4 )
+   {
+      code = lead & 0x07;
+      more = 3;
+      if (lead==0xF0) lo = 0x90;
+      else if (lead==0xF4) hi = 0x8F;
+   }
+   else
+      return 0xFFFD;
+
+   while(more--)
+   {
+      if (end && ioPtr>=end)
+         return 0xFFFD;
+      int next = *ioPtr;
+      if (next<lo || next>hi)
+         return 0xFFFD;
+      ioPtr++;
+      code = (code<<6) | (next & 0x3F);
+      lo = 0x80;
+      hi = 0xBF;
+   }
+   return code;
+}
+
+static inline int DecodeAdvanceUTF8(const unsigned char * &ioPtr)
+{
+   return DecodeAdvanceUTF8(ioPtr, nullptr);
 }
 
 
@@ -216,15 +336,20 @@ inline int Char16Advance(const char16_t *&ioStr,bool throwOnErr=true)
          return 0xFFFD;
       }
 
-      int peek = *ioStr++;
-      if (IsUtf16HighSurrogate(peek))
+      // Only a low surrogate may complete the pair.  Peek before consuming -
+      // swallowing an ordinary char here would drop it, and swallowing the
+      // NUL terminator would send the callers' scan loops off the end of
+      // the buffer.
+      int peek = *ioStr;
+      if (!IsUtf16LowSurrogate(peek))
       {
          if (throwOnErr)
             hx::Throw(HX_CSTRING("Invalid UTF16"));
          return 0xFFFD;
       }
+      ioStr++;
 
-      ch = 0x10000 + ((ch-0xd800)  << 10) | (peek-0xdc00);
+      ch = 0x10000 + ( ((ch-0xd800) << 10) | (peek-0xdc00) );
    }
    return ch;
 }
@@ -320,8 +445,10 @@ char *TConvertToUTF8(const char16_t *inStr, int *ioLen, hx::IStringAlloc *inBuff
 
 char16_t *String::allocChar16Ptr(int len)
 {
-   char16_t *result = (char16_t *)hx::InternalNew( (len+1)*2, false );
-   ((unsigned int *)result)[-1] |= HX_GC_STRING_CHAR16_T;
+   // See NewString - reserve a memoized-hash slot for longer strings
+   bool hashSlot = len >= HX_GC_STRING_HASH_SLOT_MIN_LEN;
+   char16_t *result = (char16_t *)hx::InternalNew( (len+1)*2 + (hashSlot ? 4 : 0), false );
+   ((unsigned int *)result)[-1] |= HX_GC_STRING_CHAR16_T | (hashSlot ? HX_GC_STRING_HASH_SLOT : 0);
    result[len] = 0;
    return result;
 }
@@ -426,10 +553,6 @@ static const char *GCStringDup(const T *inStr,int inLen, int *outLen=0)
 
    char16_t *result = String::allocChar16Ptr(len);
    memcpy(result,inStr,2*len);
-   if (IsUtf16LowSurrogate(result[0]))
-      result[0] = 0xFFFD;
-   if (len>1 && IsUtf16HighSurrogate(result[len-1]))
-      result[len-1] = 0xFFFD;
    return (const char *)result;
 }
 
@@ -498,6 +621,8 @@ inline String TCopyString(const T *inString,int inLength)
             unsigned int c = *s;
             if (c<0x10000)
                result[c16len++] = c;
+            else if (c>=0x110000)
+               result[c16len++] = 0xFFFD;
             else
             {
                int over = (c-0x10000);
@@ -518,6 +643,11 @@ inline String TCopyString(const T *inString,int inLength)
 }
 
 
+static inline int hxValidCodePoint(int c)
+{
+   return c<0 || c>0x10FFFF || IsUtf16Surrogate(c) ? 0xFFFD : c;
+}
+
 String __hxcpp_char_array_to_utf8_string(Array<int> &inChars,int inFirst, int inLen)
 {
    int len = inChars->length;
@@ -533,7 +663,7 @@ String __hxcpp_char_array_to_utf8_string(Array<int> &inChars,int inFirst, int in
    #ifdef HX_SMART_STRINGS
    bool hasBig = false;
    for(int i=0;i<inLen;i++)
-      if (base[i+inFirst]>127)
+      if (base[i+inFirst]>127 || base[i+inFirst]<0)
       {
          hasBig = true;
          break;
@@ -541,14 +671,24 @@ String __hxcpp_char_array_to_utf8_string(Array<int> &inChars,int inFirst, int in
 
    if (hasBig)
    {
-      char16_t *ptr = String::allocChar16Ptr(inLen);
+      int units = 0;
       for(int i=0;i<inLen;i++)
-         ptr[i] = base[i+inFirst];
-      return String(ptr, inLen);
+         units += UTF16BytesCheck(base[i+inFirst]);
+      char16_t *ptr = String::allocChar16Ptr(units);
+      char16_t *p = ptr;
+      for(int i=0;i<inLen;i++)
+         Char16AdvanceSet(p, hxValidCodePoint(base[i+inFirst]));
+      return String(ptr, units);
    }
    #endif
-   char *result = TConvertToUTF8(base+inFirst,&len,0,true);
-   return String(result,len);
+   int bytes = 0;
+   for(int i=0;i<inLen;i++)
+      bytes += UTF8Bytes(hxValidCodePoint(base[i+inFirst]));
+   char *result = hx::NewString(bytes);
+   char *p = result;
+   for(int i=0;i<inLen;i++)
+      UTF8EncodeAdvance(p, hxValidCodePoint(base[i+inFirst]));
+   return String(result,bytes);
 }
 
 Array<int> __hxcpp_utf8_string_to_char_array(String &inString)
@@ -664,6 +804,8 @@ void _hx_utf8_iter(String inString, Dynamic inIter)
 
 int _hx_utf8_char_code_at(String inString, int inIndex)
 {
+   if (inIndex<0)
+      return 0;
    #ifdef HX_SMART_STRINGS
    if (!inString.raw_ptr() || inIndex>=inString.length)
       return 0;
@@ -838,10 +980,21 @@ String::String(const Dynamic &inRHS)
 
 void String::fromInt(int inIdx)
 {
-   char buf[100];
-   SPRINTF(buf,100,HX_INT_PATTERN,inIdx);
-   buf[99]='\0';
-   __s = GCStringDup(buf,-1,&length);
+   // Write digits directly instead of going through snprintf("%d"), which pays
+   // format-string parsing on every call. Int->String is extremely common
+   // (logging, interpolation), so this is a worthwhile hot-path win.
+   char buf[12]; // "-2147483648" is 11 chars
+   char *p = buf + sizeof(buf);
+   unsigned int u = (unsigned int)inIdx;
+   if (inIdx < 0)
+      u = (unsigned int)0 - u; // magnitude, well-defined even for INT_MIN
+   do {
+      *--p = (char)('0' + (u % 10));
+      u /= 10;
+   } while (u);
+   if (inIdx < 0)
+      *--p = '-';
+   __s = GCStringDup(p, (int)(buf + sizeof(buf) - p), &length);
 }
 
 String::String(const int &inRHS)
@@ -852,26 +1005,188 @@ String::String(const int &inRHS)
 
 String::String(const unsigned int &inRHS)
 {
-   char buf[100];
-   SPRINTF(buf,100,HX_UINT_PATTERN,inRHS);
-   buf[99]='\0';
-   __s = GCStringDup(buf,-1,&length);
+   // Direct digit writing; also fixes the old HX_UINT_PATTERN "%ud", which
+   // appended a literal 'd' (e.g. "42d") for any raw unsigned int formatted here.
+   char buf[12]; // 10-digit max for unsigned 32-bit
+   char *p = buf + sizeof(buf);
+   unsigned int u = inRHS;
+   do {
+      *--p = (char)('0' + (u % 10));
+      u /= 10;
+   } while (u);
+   __s = GCStringDup(p, (int)(buf + sizeof(buf) - p), &length);
 }
 
 
 String::String(const cpp::CppInt32__ &inRHS)
 {
-   char buf[100];
-   SPRINTF(buf,100,HX_INT_PATTERN,inRHS.mValue);
-   __s = GCStringDup(buf,-1,&length);
+   fromInt(inRHS.mValue);
 }
 
 
 
+// Non-finite doubles must stringify the same as other Haxe targets (JS, hl,
+// jvm...): "NaN", "Infinity", "-Infinity". printf is platform-specific here
+// (MSVC emits "-nan(ind)"/"inf", glibc "nan"/"inf"), so handle them explicitly.
+static const char *_hx_non_finite_str(double v)
+{
+   if (v != v) return "NaN";
+   if (v == HUGE_VAL) return "Infinity";
+   if (v == -HUGE_VAL) return "-Infinity";
+   return 0;
+}
+
+// Rounds inValue to inCount significant digits and returns what they read
+// back as. outExp is the decimal exponent of the first digit
+static double hxRoundDigits(double inValue, int inCount, char *outDigits, int &outExp)
+{
+   char buf[40];
+   HX_SNPRINTF_C(buf,40,"%.*e",inCount-1,inValue);
+   const char *p = buf;
+   for(int n=0; *p!='e'; p++)
+      if (*p>='0' && *p<='9')
+         outDigits[n++] = *p;
+   outExp = atoi(p+1);
+   return hxStrtodC(buf,0);
+}
+
+static char *hxWriteExponent(char *out, int inExp)
+{
+   *out++ = 'e';
+   *out++ = inExp<0 ? '-' : '+';
+   int mag = inExp<0 ? -inExp : inExp;
+   if (mag>=100)
+      *out++ = '0' + mag/100;
+   if (mag>=10)
+      *out++ = '0' + mag/10%10;
+   *out++ = '0' + mag%10;
+   return out;
+}
+
+static double hxReadDigits(const char *inDigits, int inCount, int inExp)
+{
+   char buf[40];
+   memcpy(buf,inDigits,inCount);
+   *hxWriteExponent(buf+inCount,inExp-inCount+1) = '\0';
+   return hxStrtodC(buf,0);
+}
+
+static int hxTrimZeros(const char *inDigits, int inCount)
+{
+   while(inCount>1 && inDigits[inCount-1]=='0')
+      inCount--;
+   return inCount;
+}
+
+// The fewest significant digits that read back as inValue, which is finite
+// and positive, choosing the nearest such digits, like std::to_chars
+static int hxShortestDigits(double inValue, char *outDigits, int &outExp)
+{
+   int binExp;
+   bool powerOfTwo = inValue>DBL_MIN && frexp(inValue,&binExp)==0.5;
+   if (inValue>=DBL_MIN && !powerOfTwo)
+   {
+      // 15 digits tell normal doubles apart, so if the nearest 15 read back,
+      // they are the shortest digits padded with zeros
+      for(int count=15; count<17; count++)
+         if (hxRoundDigits(inValue,count,outDigits,outExp)==inValue)
+            return hxTrimZeros(outDigits,count);
+   }
+   else
+   {
+      // Denormals can need fewer than 15 digits, and the doubles either side
+      // of a power of two are not equally far from it, so the nearest digits
+      // can miss when the next ones up still read back
+      for(int count=1; count<17; count++)
+      {
+         double back = hxRoundDigits(inValue,count,outDigits,outExp);
+         if (back==inValue)
+            return hxTrimZeros(outDigits,count);
+         if (powerOfTwo && back<inValue)
+         {
+            int i = count-1;
+            while(i>=0 && outDigits[i]=='9')
+               outDigits[i--] = '0';
+            if (i<0)
+            {
+               outDigits[0] = '1';
+               outExp++;
+            }
+            else
+               outDigits[i]++;
+            if (hxReadDigits(outDigits,count,outExp)==inValue)
+               return hxTrimZeros(outDigits,count);
+         }
+      }
+   }
+   hxRoundDigits(inValue,17,outDigits,outExp);
+   return hxTrimZeros(outDigits,17);
+}
+
 String::String(const double &inRHS)
 {
+   const char *nonFinite = _hx_non_finite_str(inRHS);
+   if (nonFinite)
+   {
+      __s = GCStringDup(nonFinite,-1,&length);
+      return;
+   }
    char buf[100];
-   SPRINTF(buf,100,HX_DOUBLE_PATTERN,inRHS);
+   HxCNumericScope cNumeric;
+   if (HX_DOUBLE_PATTERN_CUSTOM)
+   {
+      HX_SNPRINTF_C(buf,100,HX_DOUBLE_PATTERN,inRHS);
+   }
+   else
+   {
+      // The shortest digits that read back, laid out like "%.15g", or "%.16g"
+      // and "%.17g" when more digits are needed, with the exponent trimmed to
+      // its significant digits ("1e-7") as on other Haxe targets
+      char *out = buf;
+      if (signbit(inRHS))
+         *out++ = '-';
+      double value = fabs(inRHS);
+      char digits[17];
+      int exp = 0;
+      int count = 1;
+      if (value==0)
+         digits[0] = '0';
+      else
+         count = hxShortestDigits(value,digits,exp);
+      int precision = count>15 ? count : 15;
+      if (exp<-4 || exp>=precision)
+      {
+         *out++ = digits[0];
+         if (count>1)
+         {
+            *out++ = '.';
+            memcpy(out,digits+1,count-1);
+            out += count-1;
+         }
+         out = hxWriteExponent(out,exp);
+      }
+      else if (exp>=0)
+      {
+         for(int i=0; i<=exp; i++)
+            *out++ = i<count ? digits[i] : '0';
+         if (count>exp+1)
+         {
+            *out++ = '.';
+            memcpy(out,digits+exp+1,count-exp-1);
+            out += count-exp-1;
+         }
+      }
+      else
+      {
+         *out++ = '0';
+         *out++ = '.';
+         for(int i=-1; i>exp; i--)
+            *out++ = '0';
+         memcpy(out,digits,count);
+         out += count;
+      }
+      *out = '\0';
+   }
    buf[99]='\0';
    __s = GCStringDup(buf,-1,&length);
 }
@@ -879,25 +1194,46 @@ String::String(const double &inRHS)
 
 String::String(const cpp::Int64 &inRHS)
 {
-   char buf[100];
-   SPRINTF(buf,100,"%lld", (long long int)inRHS);
-   buf[99]='\0';
-   __s = GCStringDup(buf,-1,&length);
+   // Direct digit writing instead of snprintf("%lld"); see String::fromInt.
+   char buf[24]; // "-9223372036854775808" is 20 chars
+   char *p = buf + sizeof(buf);
+   unsigned long long u = (unsigned long long)(long long)inRHS;
+   bool neg = (long long)inRHS < 0;
+   if (neg)
+      u = (unsigned long long)0 - u; // magnitude, well-defined even for INT64_MIN
+   do {
+      *--p = (char)('0' + (u % 10));
+      u /= 10;
+   } while (u);
+   if (neg)
+      *--p = '-';
+   __s = GCStringDup(p, (int)(buf + sizeof(buf) - p), &length);
 }
 
 
 String::String(const cpp::UInt64 &inRHS)
 {
-   char buf[100];
-   SPRINTF(buf,100,"%llu", (unsigned long long int)inRHS);
-   buf[99]='\0';
-   __s = GCStringDup(buf,-1,&length);
+   char buf[24]; // 20-digit max for unsigned 64-bit
+   char *p = buf + sizeof(buf);
+   unsigned long long u = (unsigned long long)inRHS;
+   do {
+      *--p = (char)('0' + (u % 10));
+      u /= 10;
+   } while (u);
+   __s = GCStringDup(p, (int)(buf + sizeof(buf) - p), &length);
 }
 
 String::String(const float &inRHS)
 {
+   const char *nonFinite = _hx_non_finite_str(inRHS);
+   if (nonFinite)
+   {
+      __s = GCStringDup(nonFinite,-1,&length);
+      return;
+   }
    char buf[100];
-   SPRINTF(buf,100,HX_DOUBLE_PATTERN,inRHS);
+   HxCNumericScope cNumeric;
+   HX_SNPRINTF_C(buf,100,HX_DOUBLE_PATTERN,inRHS);
    buf[99]='\0';
    __s = GCStringDup(buf,-1,&length);
 }
@@ -926,40 +1262,57 @@ void String::fromPointer(const void *p)
     result = result*223 + (int)(X)
 #endif
 
+#ifdef HX_SMART_STRINGS
+// Hash the utf8 encoding of the DECODED code points.  Hashing raw utf16
+// units encodes a surrogate pair as six virtual bytes where the real utf8
+// (and therefore the compile-time literal hashes and the narrow-string byte
+// hashes) has four - making equal strings hash differently.  Lone
+// surrogates hash as U+FFFD, matching the conversion routines.
+static unsigned int HashUtf16Range(const char16_t *ptr, const char16_t *end)
+{
+   unsigned int result = 0;
+   while(ptr<end)
+   {
+      int c = *ptr++;
+      if (IsUtf16HighSurrogate(c) && ptr<end && IsUtf16LowSurrogate(*ptr))
+         c = 0x10000 + ( ((c-0xd800)<<10) | ((*ptr++) - 0xdc00) );
+      else if (IsUtf16Surrogate(c))
+         c = 0xFFFD;
+
+      if( c <= 0x7F )
+      {
+         ADD_HASH(c);
+      }
+      else if( c <= 0x7FF )
+      {
+         ADD_HASH(0xC0 | (c >> 6));
+         ADD_HASH(0x80 | (c & 63));
+      }
+      else if( c <= 0xFFFF )
+      {
+         ADD_HASH(0xE0 | (c >> 12));
+         ADD_HASH(0x80 | ((c >> 6) & 63));
+         ADD_HASH(0x80 | (c & 63));
+      }
+      else
+      {
+         ADD_HASH(0xF0 | (c >> 18));
+         ADD_HASH(0x80 | ((c >> 12) & 63));
+         ADD_HASH(0x80 | ((c >> 6) & 63) );
+         ADD_HASH(0x80 | (c & 63) );
+      }
+   }
+   return result;
+}
+#endif
+
 unsigned int String::calcSubHash(int start, int inLen) const
 {
    unsigned int result = 0;
    #ifdef HX_SMART_STRINGS
    if (isUTF16Encoded())
    {
-      const char16_t *w = __w + start;
-      const char16_t *end = w + inLen;
-      while (w < end)
-      {
-         int c = Char16Advance(w, false);
-         if( c <= 0x7F )
-         {
-            ADD_HASH(c);
-         }
-         else if( c <= 0x7FF )
-         {
-            ADD_HASH(0xC0 | (c >> 6));
-            ADD_HASH(0x80 | (c & 63));
-         }
-         else if( c <= 0xFFFF )
-         {
-            ADD_HASH(0xE0 | (c >> 12));
-            ADD_HASH(0x80 | ((c >> 6) & 63));
-            ADD_HASH(0x80 | (c & 63));
-         }
-         else
-         {
-            ADD_HASH(0xF0 | (c >> 18));
-            ADD_HASH(0x80 | ((c >> 12) & 63));
-            ADD_HASH(0x80 | ((c >> 6) & 63) );
-            ADD_HASH(0x80 | (c & 63) );
-         }
-      }
+      return HashUtf16Range(__w + start, __w + start + inLen);
    }
    else
    #endif
@@ -979,34 +1332,7 @@ unsigned int String::calcHash() const
    #ifdef HX_SMART_STRINGS
    if (isUTF16Encoded())
    {
-      const char16_t *w = __w;
-      const char16_t *end = w + length;
-      while (w < end)
-      {
-         int c = Char16Advance(w, false);
-         if( c <= 0x7F )
-         {
-            ADD_HASH(c);
-         }
-         else if( c <= 0x7FF )
-         {
-            ADD_HASH(0xC0 | (c >> 6));
-            ADD_HASH(0x80 | (c & 63));
-         }
-         else if( c <= 0xFFFF )
-         {
-            ADD_HASH(0xE0 | (c >> 12));
-            ADD_HASH(0x80 | ((c >> 6) & 63));
-            ADD_HASH(0x80 | (c & 63));
-         }
-         else
-         {
-            ADD_HASH(0xF0 | (c >> 18));
-            ADD_HASH(0x80 | ((c >> 12) & 63));
-            ADD_HASH(0x80 | ((c >> 6) & 63) );
-            ADD_HASH(0x80 | (c & 63) );
-         }
-      }
+      return HashUtf16Range(__w, __w + length);
    }
    else
    #endif
@@ -1062,44 +1388,116 @@ String String::__URLEncode() const
    return String(result,l);
 }
 
+#ifdef HX_SMART_STRINGS
+// An ASCII result must be narrow to equal the same text
+static String hxNarrowIfAscii(char16_t *inWide, int inLength)
+{
+   for(int i=0;i<inLength;i++)
+      if (inWide[i]>127)
+         return String(inWide,inLength);
+   char *narrow = hx::NewString(inLength);
+   for(int i=0;i<inLength;i++)
+      narrow[i] = (char)inWide[i];
+   return String(narrow,inLength);
+}
+#endif
+
+// Case conversion returns the string itself when nothing changes, and
+// otherwise copies the unchanged start and converts the rest
 String String::toUpperCase() const
 {
+   if (!__s)
+      return String::emptyString;
    #ifdef HX_SMART_STRINGS
    if (isUTF16Encoded())
    {
+      int first = 0;
+      while(first<length && unicase_toupper(__w[first])==__w[first])
+         first++;
+      if (first==length)
+         return *this;
       char16_t *result = String::allocChar16Ptr(length);
-      for(int i=0;i<length;i++)
+      memcpy(result, __w, first*sizeof(char16_t));
+      for(int i=first;i<length;i++)
       {
          // Surrogates should already may to themselves - no need to check
          result[i] = unicase_toupper( __w[i] );
       }
-      return String(result,length);
+      return hxNarrowIfAscii(result,length);
    }
-   #endif
-
+   // Byte strings are ASCII in smart-strings mode: a branchless transform is
+   // correct and vectorizable, avoiding the per-char locale-dependent toupper.
+   int first = 0;
+   while(first<length && !(__s[first]>='a' && __s[first]<='z'))
+      first++;
+   if (first==length)
+      return *this;
    char *result = hx::NewString(length);
-   for(int i=0;i<length;i++)
+   memcpy(result, __s, first);
+   for(int i=first;i<length;i++)
+   {
+      char c = __s[i];
+      result[i] = (c>='a' && c<='z') ? (char)(c - ('a'-'A')) : c;
+   }
+   return String(result,length);
+   #else
+   int first = 0;
+   while(first<length && toupper(__s[first])==__s[first])
+      first++;
+   if (first==length)
+      return *this;
+   char *result = hx::NewString(length);
+   memcpy(result, __s, first);
+   for(int i=first;i<length;i++)
       result[i] = toupper( __s[i] );
    return String(result,length);
+   #endif
 }
 
 String String::toLowerCase() const
 {
+   if (!__s)
+      return String::emptyString;
    #ifdef HX_SMART_STRINGS
    if (isUTF16Encoded())
    {
+      int first = 0;
+      while(first<length && unicase_tolower(__w[first])==__w[first])
+         first++;
+      if (first==length)
+         return *this;
       char16_t *result = String::allocChar16Ptr(length);
-      for(int i=0;i<length;i++)
-      {
+      memcpy(result, __w, first*sizeof(char16_t));
+      for(int i=first;i<length;i++)
          result[i] = unicase_tolower( __w[i] );
-      }
-      return String(result,length);
+      return hxNarrowIfAscii(result,length);
    }
-   #endif
+   // Byte strings are ASCII in smart-strings mode: branchless, vectorizable.
+   int first = 0;
+   while(first<length && !(__s[first]>='A' && __s[first]<='Z'))
+      first++;
+   if (first==length)
+      return *this;
    char *result = hx::NewString(length);
-   for(int i=0;i<length;i++)
+   memcpy(result, __s, first);
+   for(int i=first;i<length;i++)
+   {
+      char c = __s[i];
+      result[i] = (c>='A' && c<='Z') ? (char)(c + ('a'-'A')) : c;
+   }
+   return String(result,length);
+   #else
+   int first = 0;
+   while(first<length && tolower(__s[first])==__s[first])
+      first++;
+   if (first==length)
+      return *this;
+   char *result = hx::NewString(length);
+   memcpy(result, __s, first);
+   for(int i=first;i<length;i++)
       result[i] = tolower( __s[i] );
    return String(result,length);
+   #endif
 }
 
 
@@ -1122,55 +1520,61 @@ String String::__URLDecode() const
    // [length], some memory will be wasted here, but on the assumption that
    // most URLs have only a few '%NN' encodings in them, don't bother
    // counting the number of characters in the resulting string first.
-   char *decoded = NewString(length), *d = decoded;
-
    bool hasBig = false;
 
    #ifdef HX_SMART_STRINGS
    if (isUTF16Encoded())
    {
+      // Characters above 127 are kept, as UTF-8 of up to 3 bytes per unit
+      if (length > 0x7fffffff/3)
+         hx::Throw(HX_CSTRING("String too long"));
+      char *decoded = NewString(length*3), *d = decoded;
       for (int i = 0; i < length; i++)
       {
          int c = __w[i];
          if (c > 127)
-            *d++ = '?';
+         {
+            if (IsUtf16HighSurrogate(c) && i+1<length && IsUtf16LowSurrogate(__w[i+1]))
+            {
+               c = 0x10000 + ( ((c-0xd800) << 10) | (__w[i+1]-0xdc00) );
+               i++;
+            }
+            else if (IsUtf16Surrogate(c))
+               c = 0xFFFD;
+            UTF8EncodeAdvance(d, c);
+         }
          else if (c == '+')
             *d++ = ' ';
          else if ((c == '%') && (i < (length - 2)))
          {
-            int ch = ((hex(__w[i + 1]) << 4) | (hex(__w[i + 2])));
-            if (ch>127)
-               hasBig = true;
-            *d++ = ch;
+            *d++ = ((hex(__w[i + 1]) << 4) | (hex(__w[i + 2])));
             i += 2;
          }
          else
              *d++ = c;
       }
+      return _hx_utf8_to_utf16((const unsigned char *)decoded, d-decoded,false);
    }
-   else
    #endif
+
+   char *decoded = NewString(length), *d = decoded;
+   for (int i = 0; i < length; i++)
    {
-      for (int i = 0; i < length; i++)
+      int c = (unsigned char)__s[i];
+      if (c == '+')
+         *d++ = ' ';
+      else if ((c == '%') && (i < (length - 2)))
       {
-         int c = __s[i];
-         if (c > 127)
-            *d++ = '?';
-         else if (c == '+')
-            *d++ = ' ';
-         else if ((c == '%') && (i < (length - 2)))
-         {
-            int ch = ((hex(__s[i + 1]) << 4) | (hex(__s[i + 2])));
-            #ifdef HX_SMART_STRINGS
-            if (ch>127)
-               hasBig = true;
-            #endif
-            *d++ = ch;
-            i += 2;
-         }
-         else
-             *d++ = c;
+         int ch = ((hex(__s[i + 1]) << 4) | (hex(__s[i + 2])));
+         #ifdef HX_SMART_STRINGS
+         if (ch>127)
+            hasBig = true;
+         #endif
+         *d++ = ch;
+         i += 2;
       }
+      else
+          *d++ = c;
    }
 
    #ifdef HX_SMART_STRINGS
@@ -1210,7 +1614,7 @@ const ::String &::String::makePermanent() const
          while(_hx_atomic_compare_exchange(&sPermanentStringSetMutex, 0, 1) != 0)
             __hxcpp_gc_safe_point();
          TNonGcStringSet *element = sPermanentStringSet->find(myHash ,  *this);
-         sPermanentStringSetMutex = 0;
+         _hx_atomic_store(&sPermanentStringSetMutex, 0);
          if (element)
          {
             const_cast<String *>(this)->__s = element->key.__s;
@@ -1236,7 +1640,7 @@ const ::String &::String::makePermanent() const
       while(_hx_atomic_compare_exchange(&sPermanentStringSetMutex, 0, 1) != 0)
          __hxcpp_gc_safe_point();
       sPermanentStringSet->set(*this,null());
-      sPermanentStringSetMutex = 0;
+      _hx_atomic_store(&sPermanentStringSetMutex, 0);
    }
 
    return *this;
@@ -1269,12 +1673,117 @@ String String::createPermanent(const char *inUtf8, int length)
 
 
 
+// Two-Way search (Crochemore and Perrin): linear in the text whatever the
+// needle, for when first-unit candidates keep matching a long needle's start
+template<typename T>
+static int TMaxSuffix(const T *x, int m, int &outPeriod, bool inReverse)
+{
+   int ms = -1, j = 0, k = 1;
+   outPeriod = 1;
+   while(j + k < m)
+   {
+      T a = x[j + k];
+      T b = x[ms + k];
+      if (inReverse ? a > b : a < b)
+      {
+         j += k;
+         k = 1;
+         outPeriod = j - ms;
+      }
+      else if (a == b)
+      {
+         if (k != outPeriod)
+            k++;
+         else
+         {
+            j += outPeriod;
+            k = 1;
+         }
+      }
+      else
+      {
+         ms = j;
+         j = ms + 1;
+         k = outPeriod = 1;
+      }
+   }
+   return ms;
+}
+
+template<typename T>
+static int TTwoWayIndexOf(int s, const T *str, int strLen, const T *x, int m)
+{
+   const T *y = str + s;
+   int n = strLen - s;
+   int p, q;
+   int i = TMaxSuffix(x, m, p, false);
+   int j = TMaxSuffix(x, m, q, true);
+   int ell = i > j ? i : j;
+   int per = i > j ? p : q;
+
+   if (!memcmp(x, x + per, (ell + 1)*sizeof(T)))
+   {
+      int pos = 0, memory = -1;
+      while(pos <= n - m)
+      {
+         i = (ell > memory ? ell : memory) + 1;
+         while(i < m && x[i] == y[i + pos])
+            i++;
+         if (i >= m)
+         {
+            i = ell;
+            while(i > memory && x[i] == y[i + pos])
+               i--;
+            if (i <= memory)
+               return s + pos;
+            pos += per;
+            memory = m - per - 1;
+         }
+         else
+         {
+            pos += i - ell;
+            memory = -1;
+         }
+      }
+   }
+   else
+   {
+      per = (ell + 1 > m - ell - 1 ? ell + 1 : m - ell - 1) + 1;
+      int pos = 0;
+      while(pos <= n - m)
+      {
+         i = ell + 1;
+         while(i < m && x[i] == y[i + pos])
+            i++;
+         if (i >= m)
+         {
+            i = ell;
+            while(i >= 0 && x[i] == y[i + pos])
+               i--;
+            if (i < 0)
+               return s + pos;
+            pos += per;
+         }
+         else
+            pos += i - ell;
+      }
+   }
+   return -1;
+}
+
 template<typename T>
 static int TIndexOf(int s, const T *str, int strLen, const T *sought, int soughtLen)
 {
    if (soughtLen==1)
    {
       T test = *sought;
+      // Byte strings: memchr is SIMD-optimized, much faster than a hand loop.
+      // sizeof(T)==1 is constant-folded; the memchr branch is dead for char16_t.
+      if (sizeof(T)==1 && s<strLen)
+      {
+         const T *found = (const T *)memchr(str+s, (unsigned char)test, strLen-s);
+         return found ? (int)(found-str) : -1;
+      }
       while(s<strLen)
       {
          if (str[s]==test)
@@ -1284,10 +1793,47 @@ static int TIndexOf(int s, const T *str, int strLen, const T *sought, int sought
    }
    else
    {
-      while(s+soughtLen<=strLen)
+      // Find candidate start positions with memchr (on the first unit) and only
+      // memcmp there, instead of memcmp at every position.
+      if (sizeof(T)==1)
       {
+         T first = *sought;
+         int last = strLen - soughtLen;
+         int start = s;
+         long long compared = 0;
+         while(s<=last)
+         {
+            const T *cand = (const T *)memchr(str+s, (unsigned char)first, last+1-s);
+            if (!cand)
+               return -1;
+            s = (int)(cand-str);
+            if (!memcmp(str+s, sought, soughtLen))
+               return s;
+            // Candidates that keep matching the start cost a whole compare
+            // each: past twice the text scanned, finish in linear time
+            compared += soughtLen;
+            if (soughtLen>=32 && compared > 2LL*(s-start) + 4096)
+               return TTwoWayIndexOf(s, str, strLen, sought, soughtLen);
+            s++;
+         }
+         return -1;
+      }
+      // Skip to first-unit candidates before paying for the full compare
+      T first = *sought;
+      int last = strLen - soughtLen;
+      int start = s;
+      long long compared = 0;
+      while(s<=last)
+      {
+         while(s<=last && str[s]!=first)
+            s++;
+         if (s>last)
+            break;
          if (!memcmp(str + s,sought,soughtLen*sizeof(T)))
             return s;
+         compared += soughtLen;
+         if (soughtLen>=32 && compared > 2LL*(s-start) + 4096)
+            return TTwoWayIndexOf(s, str, strLen, sought, soughtLen);
          s++;
       }
    }
@@ -1308,6 +1854,11 @@ int String::indexOf(const String &inValue, Dynamic inStart) const
    if (__s==0)
       return -1;
    int s = inStart==null() ? 0 : inStart->__ToInt();
+   // A negative start means "from the beginning" (matches other targets). Without
+   // this clamp the search reads before the buffer (out-of-bounds) and can return
+   // a bogus negative index.
+   if (s < 0)
+      s = 0;
    int l = inValue.length;
 
    if (l==0) {
@@ -1322,9 +1873,39 @@ int String::indexOf(const String &inValue, Dynamic inStart) const
       if (s016 && s116)
          return TIndexOf(s, __w, length, inValue.__w, inValue.length);
 
+      if (s016)
+      {
+         // Wide haystack, byte needle - skip to first-unit candidates.
+         // StrMatch compares against signed char, where bytes >= 0x80 can
+         // never equal a char16_t unit, so skipping on the unsigned value
+         // can only ever skip positions StrMatch would reject.
+         char16_t first = (char16_t)(unsigned char)inValue.__s[0];
+         while(s+l<=length)
+         {
+            while(s+l<=length && __w[s]!=first)
+               s++;
+            if (s+l>length)
+               break;
+            if (StrMatch(__w+s, inValue.__s, l))
+               return s;
+            s++;
+         }
+         return -1;
+      }
+
+      // Byte haystack, wide needle.  A first unit outside the signed char
+      // range can never match (StrMatch semantics), so don't scan at all;
+      // otherwise memchr candidates on the byte data.
+      char16_t first = inValue.__w[0];
+      if (first>127)
+         return -1;
       while(s+l<=length)
       {
-         if (s016 ? StrMatch(__w+s, inValue.__s, l) : StrMatch(inValue.__w, __s+s, l) )
+         const char *cand = (const char *)memchr(__s+s, (char)first, length-l-s+1);
+         if (!cand)
+            return -1;
+         s = (int)(cand-__s);
+         if (StrMatch(inValue.__w, __s+s, l))
             return s;
          s++;
       }
@@ -1351,9 +1932,10 @@ static int TLastIndexOf(int s, const T *str, int strLen, const T *sought, int so
    }
    else
    {
+      T first = *sought;
       while(s>=0)
       {
-         if (!memcmp(str + s,sought,soughtLen*sizeof(T)))
+         if (str[s]==first && !memcmp(str + s,sought,soughtLen*sizeof(T)))
             return s;
          --s;
       }
@@ -1374,6 +1956,9 @@ int String::lastIndexOf(const String &inValue, Dynamic inStart) const
    }
    if (l>length) return -1;
    if (s+l>length) s = length-l;
+   // A negative start clamps to 0 (search back from the beginning), matching
+   // other targets - e.g. "hello".lastIndexOf("h",-100) is 0, not -1.
+   if (s<0) s = 0;
 
    #ifdef HX_SMART_STRINGS
    bool s016 = isUTF16Encoded();
@@ -1383,9 +1968,35 @@ int String::lastIndexOf(const String &inValue, Dynamic inStart) const
       if (s016 && s116)
          return TLastIndexOf(s, __w, length, inValue.__w, inValue.length);
 
+      if (s016)
+      {
+         // Wide haystack, byte needle - skip backwards on the first unit
+         // (see indexOf for why the unsigned conversion is safe)
+         char16_t first = (char16_t)(unsigned char)inValue.__s[0];
+         while(s>=0)
+         {
+            while(s>=0 && __w[s]!=first)
+               s--;
+            if (s<0)
+               break;
+            if (StrMatch(__w+s, inValue.__s, l))
+               return s;
+            s--;
+         }
+         return -1;
+      }
+
+      // Byte haystack, wide needle
+      char16_t first = inValue.__w[0];
+      if (first>127)
+         return -1;
       while(s>=0)
       {
-         if (s016 ? StrMatch(__w+s, inValue.__s, l) : StrMatch(inValue.__w, __s+s, l) )
+         while(s>=0 && __s[s]!=(char)first)
+            s--;
+         if (s<0)
+            break;
+         if (StrMatch(inValue.__w, __s+s, l))
             return s;
          s--;
       }
@@ -1430,45 +2041,71 @@ String String::fromCharCode( int c )
       #endif
 
       int group = c>>10;
-      if (group>=1088)
+      // A negative code would index before the table - reject it like the
+      // codes past the end
+      if (c<0 || group>=1088)
          hx::Throw(HX_CSTRING("Invalid char code"));
-      if (!sCharToString[group])
-      {
-         String *ptr = (String *)malloc( sizeof(String)*1024 );
-         memset((void *)ptr, 0, sizeof(String)*1024 );
-         sCharToString[group] = ptr;
-      }
-      String *ptr = sCharToString[group];
       int cid = c & ((1<<10)-1);
-      if (!ptr[cid].__s)
+      String *ptr = sCharToString[group];
+      if (!ptr || !ptr[cid].__s)
       {
-         #ifdef HX_SMART_STRINGS
-         int l = UTF16BytesCheck(c);
-         char16_t *p = (char16_t *)InternalCreateConstBuffer(0,(l+1)*2,true);
-         ((unsigned int *)p)[-1] |= HX_GC_STRING_CHAR16_T;
-         if (c>=0x10000)
+         // Serialize table/entry creation so concurrent first uses do not
+         // leak a table or publish a partially-built entry
+         while(_hx_atomic_compare_exchange(&sCharToStringMutex, 0, 1) != 0)
          {
-            int over = (c-0x10000);
-            p[0] = (over>>10) + 0xd800;
-            p[1] = (over&0x3ff) + 0xdc00;
+            // Spin
          }
-         else
-            p[0] = c;
+         ptr = sCharToString[group];
+         if (!ptr)
+         {
+            ptr = (String *)malloc( sizeof(String)*1024 );
+            memset((void *)ptr, 0, sizeof(String)*1024 );
+            // The fast path reads the table without the lock - make the
+            // zeroed table visible before the pointer to it
+            std::atomic_thread_fence(std::memory_order_release);
+            sCharToString[group] = ptr;
+         }
+         if (!ptr[cid].__s)
+         {
+            #ifdef HX_SMART_STRINGS
+            int l = UTF16BytesCheck(c);
+            char16_t *p = (char16_t *)InternalCreateConstBuffer(0,(l+1)*2,true);
+            ((unsigned int *)p)[-1] |= HX_GC_STRING_CHAR16_T;
+            if (c>=0x10000)
+            {
+               int over = (c-0x10000);
+               p[0] = (over>>10) + 0xd800;
+               p[1] = (over&0x3ff) + 0xdc00;
+            }
+            else
+               p[0] = c;
 
-         ptr[cid].length = l;
-         ptr[cid].__w = p;
-         fixHashPerm16(ptr[cid]);
-         #else
-         char buf[5];
-         int  utf8Len = UTF8Bytes(c);
-         char *p = buf;
-         UTF8EncodeAdvance(p,c);
-         buf[utf8Len] = '\0';
-         const char *s = (char *)InternalCreateConstBuffer(buf,utf8Len+1,true);
-         ptr[cid].length = utf8Len;
-         ptr[cid].__s = s;
-         #endif
+            // Hash the buffer before the entry becomes visible to the
+            // lock-free fast path, then store the string pointer last
+            String tmp;
+            tmp.length = l;
+            tmp.__w = p;
+            fixHashPerm16(tmp);
+            ptr[cid].length = l;
+            std::atomic_thread_fence(std::memory_order_release);
+            ptr[cid].__w = p;
+            #else
+            char buf[5];
+            int  utf8Len = UTF8Bytes(c);
+            char *p = buf;
+            UTF8EncodeAdvance(p,c);
+            buf[utf8Len] = '\0';
+            const char *s = (char *)InternalCreateConstBuffer(buf,utf8Len+1,true);
+            ptr[cid].length = utf8Len;
+            std::atomic_thread_fence(std::memory_order_release);
+            ptr[cid].__s = s;
+            #endif
+         }
+         _hx_atomic_store(&sCharToStringMutex, 0);
       }
+      // Pairs with the release fences above: having seen the string
+      // pointer, see the length and characters written before it
+      std::atomic_thread_fence(std::memory_order_acquire);
       return ptr[cid];
    }
 }
@@ -1482,7 +2119,9 @@ String String::charAt( int at ) const
    if (isUTF16Encoded())
       return fromCharCode(__w[at]);
    #endif
-   return fromCharCode(__s[at]);
+   // char is signed on most targets - a byte >= 0x80 must not become a
+   // negative char code
+   return fromCharCode(((const unsigned char *)__s)[at]);
 }
 
 void __hxcpp_bytes_of_string(Array<unsigned char> &outBytes,const String &inString)
@@ -1493,33 +2132,19 @@ void __hxcpp_bytes_of_string(Array<unsigned char> &outBytes,const String &inStri
    #ifdef HX_SMART_STRINGS
    if (inString.isUTF16Encoded())
    {
+      // Two-pass encode: size the output once, then write directly into the
+      // buffer instead of paying a bounds-checked push per byte
       const char16_t *src = inString.raw_wptr();
       const char16_t *end = src + inString.length;
+      int bytes = 0;
       while(src<end)
-      {
-         int c = Char16Advance(src);
+         bytes += UTF8Bytes( Char16Advance(src,false) );
 
-         if( c <= 0x7F )
-            outBytes->push(c);
-         else if( c <= 0x7FF )
-         {
-            outBytes->push( 0xC0 | (c >> 6) );
-            outBytes->push( 0x80 | (c & 63) );
-         }
-         else if( c <= 0xFFFF )
-         {
-            outBytes->push( 0xE0 | (c >> 12) );
-            outBytes->push( 0x80 | ((c >> 6) & 63) );
-            outBytes->push( 0x80 | (c & 63) );
-         }
-         else
-         {
-            outBytes->push( 0xF0 | (c >> 18) );
-            outBytes->push( 0x80 | ((c >> 12) & 63) );
-            outBytes->push( 0x80 | ((c >> 6) & 63) );
-            outBytes->push( 0x80 | (c & 63) );
-         }
-      }
+      outBytes->__SetSize(bytes);
+      char *ptr = outBytes->GetBase();
+      src = inString.raw_wptr();
+      while(src<end)
+         UTF8EncodeAdvance(ptr, Char16Advance(src,false));
    }
    else
    #endif
@@ -1532,11 +2157,6 @@ void __hxcpp_bytes_of_string(Array<unsigned char> &outBytes,const String &inStri
 #ifdef HX_SMART_STRINGS
 String _hx_utf8_to_utf16(const unsigned char *ptr, int inUtf8Len, bool addHash)
 {
-   unsigned int hash = 0;
-   if (addHash)
-      for(int i=0;i<inUtf8Len;i++)
-         hash = hash*223 + ptr[i];
-
    int char16Count = 0;
    const unsigned char *u = ptr;
    const unsigned char *end = ptr + inUtf8Len;
@@ -1546,8 +2166,14 @@ String _hx_utf8_to_utf16(const unsigned char *ptr, int inUtf8Len, bool addHash)
       char16Count += UTF16BytesCheck(code);
    }
 
+   // Reserve a slot and let String::hash() memoize lazily.  The old eager
+   // bake hashed the raw utf8 input, which could differ from the hash of
+   // the decoded content (invalid sequences become U+FFFD), and stored it
+   // at an address the reader did not use for wide strings - equal strings
+   // then hashed differently and missed each other in string maps.
+   bool hashSlot = addHash || char16Count >= HX_GC_STRING_HASH_SLOT_MIN_LEN;
    int allocSize = 2*(char16Count+1);
-   if (addHash)
+   if (hashSlot)
       allocSize += sizeof(int);
    char16_t *str = (char16_t *)NewGCPrivate(0,allocSize);
 
@@ -1558,17 +2184,7 @@ String _hx_utf8_to_utf16(const unsigned char *ptr, int inUtf8Len, bool addHash)
       int code = DecodeAdvanceUTF8(u,end);
       Char16AdvanceSet(o,code);
    }
-   if (addHash)
-   {
-      #ifdef __EMSCRIPTEN__
-         *((emscripten_align1_int *)(str+char16Count+1) ) = hash;
-      #else
-         *((unsigned int *)(str+char16Count+1) ) = hash;
-      #endif
-      ((unsigned int *)(str))[-1] |= HX_GC_STRING_HASH | HX_GC_STRING_CHAR16_T;
-   }
-   else
-      ((unsigned int *)(str))[-1] |= HX_GC_STRING_CHAR16_T;
+   ((unsigned int *)(str))[-1] |= HX_GC_STRING_CHAR16_T | (hashSlot ? HX_GC_STRING_HASH_SLOT : 0);
 
    return String(str, char16Count);
 }
@@ -1799,7 +2415,7 @@ wchar_t *ConvertToWChar(const char *inStr, int *ioLen)
       {
         int c2 = b[i++];
         int c3 = b[i++];
-        result[l++] = ( ((c & 0x0F) << 18) | ((c2 & 0x7F) << 12) | ((c3 << 6) & 0x7F) | (b[i++] & 0x7F) );
+        result[l++] = ( ((c & 0x0F) << 18) | ((c2 & 0x7F) << 12) | ((c3 & 0x7F) << 6) | (b[i++] & 0x7F) );
       }
    }
    result[l] = '\0';
@@ -1922,7 +2538,7 @@ bool String::utf8_str(::cpp::marshal::View<char> buffer, int* outByteLength) con
     {
         auto cursor = __w;
 
-        while (Char16Advance(cursor)) {}
+        while (Char16Advance(cursor,false)) {}
 
         auto calculated = cursor - __w - 1;
 
@@ -1933,7 +2549,7 @@ bool String::utf8_str(::cpp::marshal::View<char> buffer, int* outByteLength) con
 
         while (cursor < end)
         {
-            chars += UTF8Bytes(Char16Advance(cursor));
+            chars += UTF8Bytes(Char16Advance(cursor,false));
         }
 
         if (buffer.length < chars + 1)
@@ -1946,7 +2562,7 @@ bool String::utf8_str(::cpp::marshal::View<char> buffer, int* outByteLength) con
 
         while (cursor < end)
         {
-            UTF8EncodeAdvance(output, Char16Advance(cursor));
+            UTF8EncodeAdvance(output, Char16Advance(cursor,false));
         }
 
         *output = 0;
@@ -2002,13 +2618,19 @@ const wchar_t * String::wchar_str(hx::IStringAlloc *inBuffer) const
    {
       result = (wchar_t *)NewGCPrivate(0,sizeof(wchar_t)*(length+1) );
    }
+   int n = 0;
    if (isUTF16Encoded())
       for(int i=0;i<length;i++)
-         result[i] = __w[i];
+      {
+         int c = __w[i];
+         if (IsUtf16HighSurrogate(c) && i+1<length && IsUtf16LowSurrogate(__w[i+1]))
+            c = 0x10000 + ((c-0xd800)<<10) + (__w[++i]-0xdc00);
+         result[n++] = c;
+      }
    else
       for(int i=0;i<length;i++)
-         result[i] = __s[i];
-   result[length] = 0;
+         result[n++] = __s[i];
+   result[n] = 0;
    return result;
    #else
 
@@ -2086,7 +2708,7 @@ Array<String> String::split(const String &inDelimiter) const
       else
       {
          for(int i=0;i<chars;i++)
-            result[i] = String::fromCharCode( __s[i] );
+            result[i] = String::fromCharCode( ((const unsigned char *)__s)[i] );
       }
       #else
       for(int i=0;i<chars; )
@@ -2095,7 +2717,7 @@ Array<String> String::split(const String &inDelimiter) const
          const unsigned char *ptr = start;
          DecodeAdvanceUTF8(ptr);
          int len =  ptr - start;
-         result[idx++] = String::create( __s+i, len );
+         result->push( String::create( __s+i, len ) );
          i+=len;
       }
       #endif
@@ -2111,8 +2733,16 @@ Array<String> String::split(const String &inDelimiter) const
    {
       if (s0 && s1)
       {
+         // Skip to candidate positions on the first unit before paying for
+         // the full compare
+         char16_t c0 = inDelimiter.__w[0];
          while(pos+len <=length )
-            if (!memcmp(__w+pos,inDelimiter.__w,len*2))
+         {
+            while(pos+len<=length && __w[pos]!=c0)
+               pos++;
+            if (pos+len>length)
+               break;
+            if (len==1 || !memcmp(__w+pos+1,inDelimiter.__w+1,(len-1)*2))
             {
                result->push( substr(last,pos-last) );
                pos += len;
@@ -2120,6 +2750,7 @@ Array<String> String::split(const String &inDelimiter) const
             }
             else
                pos++;
+         }
       }
       else if (s0)
          while(pos+len <=length )
@@ -2145,8 +2776,19 @@ Array<String> String::split(const String &inDelimiter) const
    else
    #endif
    {
+      // memchr candidate scan, like indexOf - far faster than a libc call
+      // per byte position, and memcmp does not stop at embedded NULs the
+      // way strncmp does (a delimiter containing \0 matched any \0)
+      const char *base = __s;
+      const char *del = inDelimiter.__s;
+      char c0 = del[0];
       while(pos+len <=length )
-         if (!strncmp(__s+pos,inDelimiter.__s,len))
+      {
+         const char *found = (const char *)memchr(base+pos, c0, length-len-pos+1);
+         if (!found)
+            break;
+         pos = (int)(found-base);
+         if (len==1 || !memcmp(found+1,del+1,len-1))
          {
             result->push( substr(last,pos-last) );
             pos += len;
@@ -2154,6 +2796,7 @@ Array<String> String::split(const String &inDelimiter) const
          }
          else
             pos++;
+      }
    }
 
    result->push( substr(last,null()) );
@@ -2188,6 +2831,8 @@ String String::substr(int inFirst, Dynamic inLen) const
    if ((len+inFirst > length) ) len = length - inFirst;
    if (len==0)
       return String::emptyString;
+   if (inFirst==0 && len==length)
+      return *this;
 
 
    #ifdef HX_SMART_STRINGS
@@ -2200,7 +2845,7 @@ String String::substr(int inFirst, Dynamic inLen) const
    #endif
 
    if (len==1)
-      return String::fromCharCode(__s[inFirst]);
+      return String::fromCharCode(((const unsigned char *)__s)[inFirst]);
 
    return String( GCStringDup(__s+inFirst, len, 0), len );
 }
@@ -2354,6 +2999,7 @@ String &String::operator+=(const String &inRHS)
                 void __SetThis(Dynamic inThis) override \
                 { \
                     mThis = inThis; \
+                    HX_OBJ_WB_GET(this, mThis.raw_ptr()); \
                 } \
                 void* __GetHandle() const override { return const_cast<char *>(mThis.raw_ptr()); } \
                 void __Mark(hx::MarkContext *__inCtx) override { HX_MARK_MEMBER(mThis); } \
@@ -2428,7 +3074,7 @@ String &String::operator+=(const String &inRHS)
           return mThis.func(arg_list); return Dynamic(); \
        } \
        STRING_VISIT_FUNC \
-       void  __SetThis(Dynamic inThis) HXCPP_OVERRIDE { mThis = inThis; } \
+       void  __SetThis(Dynamic inThis) HXCPP_OVERRIDE { mThis = inThis; HX_OBJ_WB_GET(this, mThis.raw_ptr()); } \
     }; \
     Dynamic String::func##_dyn()  { return new __String_##func(*this);  }
 
@@ -2519,7 +3165,8 @@ public:
    double __ToDouble() const HXCPP_OVERRIDE
    {
       if (!mValue.raw_ptr()) return 0;
-      return atof(mValue.utf8_str());
+
+      return hxStrtodC(mValue.utf8_str(),0);
    }
    int __length() const HXCPP_OVERRIDE { return mValue.length; }
 

@@ -23,10 +23,37 @@ int myp_recv( MYSQL *m, void *buf, int size ) {
    return myp_recv_no_gc(m,buf,size);
 }
 
+/*
+	While a connection opens, each read waits only for what is left of the
+	connect timeout, not for the whole of it again: a server that sent its
+	greeting a byte at a time, each inside the timeout, held mysql_open for as
+	long as it went on. False once nothing is left. A read on TLS asks this
+	from the record layer, for each read of the socket it makes.
+*/
+int myp_wait_budget( MYSQL *m ) {
+	double left;
+	if( m->deadline <= 0 )
+		return 1;
+	left = m->deadline - psock_clock();
+	if( left < 0.000001 )
+		return 0;
+	psock_set_recv_timeout(m->s,left);
+	return 1;
+}
+
 int myp_recv_no_gc( MYSQL *m, void *buf, int size ) {
 	while( size ) {
-		int len = psock_recv_no_gc(m->s,(char*)buf,size);
-		if( len <= 0 ) return size == 0 ? 1 : 0;
+		int len;
+		if( !m->tls && !myp_wait_budget(m) ) {
+			m->timed_out = 1;
+			return 0;
+		}
+		len = m->tls ? myp_tls_recv(m,buf,size) : psock_recv_no_gc(m->s,(char*)buf,size);
+		if( len <= 0 ) {
+			if( len == PS_BLOCK && !m->tls )
+				m->timed_out = 1;
+			return size == 0 ? 1 : 0;
+		}
 		buf = ((char*)buf) + len;
 		size -= len;
 	}
@@ -41,8 +68,12 @@ int myp_send( MYSQL *m, void *buf, int size ) {
 
 int myp_send_no_gc( MYSQL *m, void *buf, int size ) {
 	while( size ) {
-		int len = psock_send_no_gc(m->s,(char*)buf,size);
-		if( len <= 0 ) return size == 0 ? 1 : 0;
+		int len = m->tls ? myp_tls_send(m,buf,size) : psock_send_no_gc(m->s,(char*)buf,size);
+		if( len <= 0 ) {
+			if( len == PS_BLOCK && !m->tls )
+				m->timed_out = 1;
+			return size == 0 ? 1 : 0;
+		}
 		buf = ((char*)buf) + len;
 		size -= len;
 	}
@@ -93,8 +124,42 @@ int myp_read_bin( MYSQL_PACKET *p ) {
 		myp_read(p,&c,3);
 		return c;
 	}
-	if( c == 254 )
-		return myp_read_int(p);
+	if( c == 254 ) {
+		// Eight bytes follow, not four. Reading four left the other four to
+		// be taken for whatever came next -- the status flags of an OK
+		// packet, or the next column of a row.
+		long long v = 0;
+		myp_read(p,&v,8);
+		if( v < 0 || v > 0x7FFFFFFF ) {
+			p->error = 1;
+			return 0;
+		}
+		return (int)v;
+	}
+	p->error = 1;
+	return 0;
+}
+
+// A length-encoded integer at its full width, for the counts an OK packet
+// carries: affected rows and the insert id are 64-bit.
+long long myp_read_bin64( MYSQL_PACKET *p ) {
+	int c = myp_read_byte(p);
+	if( c <= 250 )
+		return c;
+	if( c == 251 )
+		return -1; // NULL
+	if( c == 252 )
+		return myp_read_ui16(p);
+	if( c == 253 ) {
+		int v = 0;
+		myp_read(p,&v,3);
+		return v;
+	}
+	if( c == 254 ) {
+		long long v = 0;
+		myp_read(p,&v,8);
+		return v;
+	}
 	p->error = 1;
 	return 0;
 }
@@ -115,11 +180,18 @@ char *myp_read_bin_str( MYSQL_PACKET *p ) {
 	char *str;
 	if( size == -1 )
 		return NULL;
-	if( p->error || p->pos + size > p->size ) {
+	// Against what is left of the packet, not by adding the length to the
+	// position: a length near 2^31 wrapped the sum negative, passed, and
+	// sized a malloc of size + 1, which wrapped too -- NULL, copied into.
+	if( p->error || size < 0 || size > p->size - p->pos ) {
 		p->error = 1;
 		return NULL;
 	}
 	str = (char*)malloc(size + 1);
+	if( str == NULL ) {
+		p->error = 1;
+		return NULL;
+	}
 	memcpy(str,p->buf + p->pos, size);
 	str[size] = 0;
 	p->pos += size;
@@ -139,9 +211,19 @@ int myp_read_packet( MYSQL *m, MYSQL_PACKET *p ) {
 	//p->id = (psize >> 24);
 	psize &= 0xFFFFFF;
 	p->size = psize;
-	if( p->mem < (int)psize ) {
+	// A buffer is made when there is none, whatever the size: the rows of a
+	// result keep the buffers they arrive in, and the connection's own was
+	// let go before the first, so an empty packet then wrote its end marker
+	// through a null pointer.
+	if( p->buf == NULL || p->mem < (int)psize ) {
+		char *buf = (char*)malloc(psize + 1);
+		if( buf == NULL ) {
+			p->error = 1;
+			p->size = 0;
+			return 0;
+		}
 		free(p->buf);
-		p->buf = (char*)malloc(psize + 1);
+		p->buf = buf;
 		p->mem = psize;
 	}
 	p->buf[psize] = 0;
@@ -324,28 +406,42 @@ void myp_encrypt_pass_323( const char *password, const char seed[SEED_LENGTH_323
 }
 
 // defined in mysql/strings/ctype-*.c
+//
+// The collation the greeting names is the server's default, one byte of it.
+// MySQL 8 defaults to utf8mb4_0900_ai_ci, 255, which was missing: against a
+// default MySQL 8 server every escape threw "Unsupported charset : #255".
 const char *myp_charset_name( int charset ) {
 	switch( charset ) {
+	case 5:
 	case 8:
+	case 15:
 	case 31:
 	case 47:
+	case 48:
+	case 49:
+	case 94:
 		return "latin1";
+	case 11:
+	case 65:
+		return "ascii";
 	case 63:
 		return "binary";
 	// 101+ : utf16
 	// 160+ : utf32
 	case 33:
+	case 76:
 	case 83:
 	case 223:
 	case 254:
 		return "utf8";
 	case 45:
 	case 46:
+	case 255:
 		return "utf8mb4"; // superset of utf8 with up to 4 bytes per-char
 	default:
-		if( charset >= 192 && charset <= 211 )
+		if( charset >= 192 && charset <= 215 )
 			return "utf8";
-		if( charset >= 224 && charset <= 243 )
+		if( charset >= 224 && charset <= 247 )
 			return "utf8mb4";
 	}
 	return NULL;

@@ -160,6 +160,7 @@ public:
    static bool SetNoStaticField(const String &inString, Dynamic &ioValue, hx::PropertyAccess inCallProp);
 
    void registerScriptable(bool inOverwrite);
+   void unregisterScriptable();
   
 	hx::CanCastFunc     mCanCast;
 
@@ -193,6 +194,10 @@ public:
    #endif
    Array<String>      mStatics;
    Array<String>      mMembers;
+   // Lazily-built full instance-field list (class metadata is immutable
+   // after registration).  GC-allocated, so MarkStatics/VisitStatics must
+   // include it - Class_obj itself is a const allocation.
+   Array<String>      mInstanceFieldsCache;
 
    #ifdef HXCPP_SCRIPTABLE
    const hx::StorageInfo*    mMemberStorageInfo;
@@ -279,11 +284,15 @@ inline bool TIsInterface(hx::Object *inPtr)
 
 HXCPP_EXTERN_CLASS_ATTRIBUTES void RegisterVTableOffset(int inOffset);
 
+// Generated for each @:nativeGen interface a class implements. Haxe makes those
+// interfaces virtual bases, whose offset can only be read from a constructed
+// object, and a null CLASS* converts to a null INTERFACE*, so this registers 0.
+// hx::Native registers the real offset when it converts an object instead.
 #define HX_REGISTER_VTABLE_OFFSET( CLASS, INTERFACE ) \
 { \
    CLASS *dummy = (CLASS *)0; \
    INTERFACE *intf = dummy; \
-   ::hx::RegisterVTableOffset( (int)( (size_t)((char *)intf - (char *)dummy)) ); \
+   ::hx::RegisterVTableOffset( (uintptr_t)(reinterpret_cast<char *>(intf) - reinterpret_cast<char *>(dummy)) ); \
 }
 
 

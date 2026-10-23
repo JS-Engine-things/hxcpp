@@ -15,11 +15,18 @@ namespace hx
 {
 	namespace thread
 	{
+		int ThreadLocalLiveGeneration(int slot);
+
 		class ThreadImpl_obj final : public Thread_obj
 		{
-			int cursor;
+			int cursor = 0;
+			// Start of the newest pooled scratch allocation, or -1
+			int scratchTop = -1;
 			Array<uint8_t> scratch;
 			Array<Dynamic> slots;
+			// ThreadLocal values, apart from the legacy __hxcpp_tls_* slots
+			Array<Dynamic> localSlots;
+			Array<int> localGenerations;
 
 		public:
 			friend class Scratch;
@@ -28,13 +35,15 @@ namespace hx
 			{
 				std::thread thread;
 				std::thread::native_handle_type handle;
+				bool ownsHandle;
 
 				Native();
 				Native(Thread_obj::CreateFunction _job, ThreadImpl _thread, CountingSemaphore _semaphore);
+				~Native();
 			};
 
-			Native* native;
 			const int id;
+			Native* native;
 
 			ThreadImpl_obj(const int _id);
 			ThreadImpl_obj(const int _id, Thread_obj::CreateFunction _run, CountingSemaphore _semaphore);
@@ -44,6 +53,8 @@ namespace hx
 
 			Dynamic getSlot(const int id);
 			void setSlot(const int id, const Dynamic& obj);
+			Dynamic getLocal(const int slot, const int generation);
+			void setLocal(const int slot, const int generation, const Dynamic& obj);
 
 			String toString() HXCPP_OVERRIDE;
 

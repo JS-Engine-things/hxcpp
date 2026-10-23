@@ -19,6 +19,17 @@ hx::thread::RecursiveMutex_obj::RecursiveMutex_obj() : impl(new Impl())
 
 void hx::thread::RecursiveMutex_obj::acquire()
 {
+	// Uncontended fast path - no need for the GC free zone (stack capture
+	// plus collector handshake) unless we are actually going to block
+	// The free zone below was this thread's handshake with the collector. A
+	// thread that only ever takes the lock uncontended, allocating nothing,
+	// otherwise never reaches a safe point, and a collection waits for it
+	// for ever.
+	if (hx::gPauseForCollect)
+		__hxcpp_gc_safe_point();
+	if (impl->mutex.try_lock())
+		return;
+
 	hx::AutoGCFreeZone zone;
 
 	impl->mutex.lock();
@@ -31,5 +42,8 @@ void hx::thread::RecursiveMutex_obj::release()
 
 bool hx::thread::RecursiveMutex_obj::tryAcquire()
 {
+	// A thread polling without allocating must still reach a safe point
+	if (hx::gPauseForCollect)
+		__hxcpp_gc_safe_point();
 	return impl->mutex.try_lock();
 }

@@ -2,6 +2,7 @@
 #define INCLUDED_HX_SCRIPTABLE
 
 #include <typeinfo>
+#include <string.h>
 #ifdef __clang__
 #pragma clang diagnostic ignored "-Winvalid-offsetof"
 #endif
@@ -36,30 +37,22 @@ struct ScriptNamedFunction : public ScriptFunction
 };
 
 
+// cppia frames pack values, so a Float can be at any 4-byte offset. memcpy
+// reads and writes it there on every target, and compiles to a single load or
+// store wherever the target allows that. The HXCPP_ALIGN_FLOAT version copied
+// the two halves by hand and wrote only the high one, so on 32-bit ARM and
+// Emscripten a Float stored in a frame kept a stale low half.
 inline void SetFloatAligned(void *inPtr, const Float &inValue)
 {
-   #ifdef HXCPP_ALIGN_FLOAT
-   int *dest = (int *)inPtr;
-   const int *src = (const int *)&inValue;
-   dest[1] = src[1];
-   #else
-   *(Float *)inPtr = inValue;
-   #endif
+   memcpy(inPtr, &inValue, sizeof(Float));
 }
 
 
 inline Float GetFloatAligned(const void *inPtr)
 {
-   #ifdef HXCPP_ALIGN_FLOAT
    Float result;
-   int *dest = (int *)&result;
-   const int *src = (const int *)inPtr;
-   dest[0] = src[0];
-   dest[1] = src[1];
+   memcpy(&result, inPtr, sizeof(Float));
    return result;
-   #else
-   return *(Float *)inPtr;
-   #endif
 }
 
 
@@ -191,7 +184,10 @@ public:
    virtual void run() = 0;
    virtual void boot() = 0;
    virtual ::hx::Class resolveClass( ::String inName) = 0;
-   virtual void unload() { }
+   // Unregisters the module's classes and resources and clears its statics.
+   // Its code is freed once nothing from it is in use (docs/CppiaModuleRelease.md).
+   virtual void release() { }
+   void unload() { release(); }
 };
 typedef ::hx::ObjectPtr<CppiaLoadedModule_obj> CppiaLoadedModule;
 
@@ -205,6 +201,8 @@ void __scriptable_load_cppia(String inCode);
 ::hx::CppiaLoadedModule __scriptable_cppia_from_data(Array<unsigned char> inBytes);
 void __scriptable_load_neko_bytes(Array<unsigned char> inBytes);
 void __scriptable_load_abc(Array<unsigned char> inBytes);
+// Modules whose native memory has not been freed yet
+int __scriptable_cppia_live_modules();
 
 #define HX_SCRIPTABLE_REGISTER_INTERFACE(name,class) \
    ::hx::ScriptableRegisterInterface( HX_CSTRING(name), __scriptableFunctions, & class##_scriptable )
@@ -219,6 +217,26 @@ void __Visit(HX_VISIT_PARAMS) HXCPP_OVERRIDE { super::__Visit(HX_VISIT_ARG); ::h
 #else
 #define SCRIPTABLE_VISIT_FUNCTION
 #endif
+
+
+/*
+ * A Haxe `toString` with parameters, whatever they are, compiles to a C++ overload that
+ * hides `hx::Object::toString()` without overriding it. In a class that inherits it,
+ * `__superString` is that class, so `__superString::toString()` does not compile.
+ * Native code calling `toString()` on such an object reaches `hx::Object::toString()`,
+ * so the scriptable wrapper calls that one in this case.
+ */
+template<typename T>
+inline auto _hx_scriptable_super_toString(T *inSelf, int) -> decltype(inSelf->T::toString(), ::String())
+{
+   return inSelf->T::toString();
+}
+
+template<typename T>
+inline ::String _hx_scriptable_super_toString(T *inSelf, ...)
+{
+   return inSelf->::hx::Object::toString();
+}
 
 
 #define HX_DEFINE_SCRIPTABLE(ARG_LIST) \
@@ -236,7 +254,7 @@ void __Visit(HX_VISIT_PARAMS) HXCPP_OVERRIDE { super::__Visit(HX_VISIT_ARG); ::h
    void ** __GetScriptVTable() HXCPP_OVERRIDE { return __scriptVTable; } \
    ::String toString() HXCPP_OVERRIDE {  if (__scriptVTable[0] ) \
      { ::hx::CppiaCtx *ctx = ::hx::CppiaCtx::getCurrent(); ::hx::AutoStack a(ctx); ctx->pushObject(this); return ctx->runString(__scriptVTable[0]); } \
-      else return __superString::toString(); } \
+      else return _hx_scriptable_super_toString<__superString>(static_cast<__superString *>(this), 0); } \
    ::String __ToString() const HXCPP_OVERRIDE { return ::hx::ScriptableToString(__scriptVTable[-1]); } \
    ::hx::Class __GetClass() const HXCPP_OVERRIDE { return ::hx::ScriptableGetClass(__scriptVTable[-1]); } \
    int __GetType() const HXCPP_OVERRIDE { return ::hx::ScriptableGetType(__scriptVTable[-1]); } \
