@@ -168,16 +168,27 @@ static int sgKinds = (int)(vtAbstractBase + 5);
 
 typedef std::map<std::string,int> KindMap;
 typedef std::map<int,std::string> ReverseKindMap;
-static KindMap sgKindMap;
-static ReverseKindMap sgReverseKindMap;
+// Made on first use, as an extension can share a kind from a static
+//  initializer, and never destroyed, so a thread still running at exit
+//  cannot use them after their destructors ran (#371)
+static KindMap &sgKindMap()
+{
+   static KindMap *map = new KindMap();
+   return *map;
+}
+static ReverseKindMap &sgReverseKindMap()
+{
+   static ReverseKindMap *map = new ReverseKindMap();
+   return *map;
+}
 
 // Plugins can register kinds from any thread (concurrent cpp.Lib.load) -
 // an unsynchronized counter could mint duplicate kind ids, confusing
 // val_to_kind type checks across plugins
 static std::mutex &KindMutex()
 {
-   static std::mutex m;
-   return m;
+   static std::mutex *m = new std::mutex();
+   return *m;
 }
 
 int hxcpp_alloc_kind()
@@ -190,11 +201,11 @@ int hxcpp_alloc_kind()
 void hxcpp_kind_share(int &ioKind,const char *inName)
 {
    std::lock_guard<std::mutex> lock(KindMutex());
-   int &kind = sgKindMap[inName];
+   int &kind = sgKindMap()[inName];
    if (kind==0)
       kind = ++sgKinds;
    ioKind = kind;
-   sgReverseKindMap[kind] = inName;
+   sgReverseKindMap()[kind] = inName;
 }
 
 String __hxcpp_get_kind(Dynamic inObject)
@@ -210,8 +221,8 @@ String __hxcpp_get_kind(Dynamic inObject)
    std::string name;
    {
       std::lock_guard<std::mutex> lock(KindMutex());
-      ReverseKindMap::const_iterator it = sgReverseKindMap.find(type);
-      if (it==sgReverseKindMap.end())
+      ReverseKindMap::const_iterator it = sgReverseKindMap().find(type);
+      if (it==sgReverseKindMap().end())
          return null();
       name = it->second;
    }
@@ -783,13 +794,33 @@ hx::Object * val_call3(hx::Object * arg1,hx::Object * arg2,hx::Object * arg3,hx:
 }
 
 
+// Up to five arguments go to the fixed-arity entry points, as val_call0 to
+// val_call3 do, which pack them into an array only for a function that has
+// no such entry point.  Building the array here first allocated it for every
+// call
+static hx::Object *callVector(hx::Object *inFunc, hx::Object **inArgs, int nCount)
+{
+#if (HXCPP_API_LEVEL<500)
+   switch(nCount)
+   {
+      case 0: return inFunc->__run().GetPtr();
+      case 1: return inFunc->__run(inArgs[0]).GetPtr();
+      case 2: return inFunc->__run(inArgs[0], inArgs[1]).GetPtr();
+      case 3: return inFunc->__run(inArgs[0], inArgs[1], inArgs[2]).GetPtr();
+      case 4: return inFunc->__run(inArgs[0], inArgs[1], inArgs[2], inArgs[3]).GetPtr();
+      case 5: return inFunc->__run(inArgs[0], inArgs[1], inArgs[2], inArgs[3], inArgs[4]).GetPtr();
+   }
+#endif
+   Array<Dynamic> args = Array_obj<Dynamic>::__new(0, nCount);
+   while (nCount-- > 0)
+     args << *inArgs++;
+   return inFunc->__Run( args ).GetPtr();
+}
+
 hx::Object * val_callN(hx::Object * arg1,hx::Object ** arg2, int nCount) THROWS
 {
    if (!arg1) Dynamic::ThrowBadFunctionError();
-   Array<Dynamic> args = Array_obj<Dynamic>::__new(0, nCount);
-   while (nCount--)
-     args << *arg2++;
-   return arg1->__Run( args ).GetPtr();
+   return callVector(arg1, arg2, nCount);
 }
 
 
@@ -843,10 +874,7 @@ hx::Object * val_ocallN(hx::Object * arg1,int arg2,hx::Object ** arg3, int nCoun
    if (!arg1) hx::Throw(HX_INVALID_OBJECT);
    Dynamic field = arg1->__IField(arg2);
    if (!field.mPtr) Dynamic::ThrowBadFunctionError();
-   Array<Dynamic> args = Array_obj<Dynamic>::__new(0, nCount);
-   while (nCount-- > 0)
-     args << *arg3++;
-   return field->__Run( args ).GetPtr();
+   return callVector(field.mPtr, arg3, nCount);
 }
 
 

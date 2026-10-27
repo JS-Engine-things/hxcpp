@@ -86,8 +86,10 @@
 // copy under the lock.
 static HxMutex &hxEnvMutex()
 {
-   static HxMutex sMutex;
-   return sMutex;
+   // Never destroyed, so a thread reading the environment at exit cannot
+   //  take it after its destructor ran (#371)
+   static HxMutex *sMutex = new HxMutex();
+   return *sMutex;
 }
 
 String _hx_std_get_env( String v )
@@ -483,6 +485,9 @@ void  _hx_std_sys_rename( String path, String newname )
 }
 
 #define STATF(f) o->Add(HX_CSTRING(#f),(int)(s.st_##f))
+// Times as Float seconds: an Int ends in 2038. FileSystem.stat multiplies
+//  them by 1000.0 for Date.fromTime, which takes either
+#define STATT(f) o->Add(HX_CSTRING(#f),(double)(s.st_##f))
 
 // statx reports when a file was created, where <sys/stat.h> declares it
 #if defined(__linux__) && defined(STATX_BTIME) && (!defined(__ANDROID__) || __ANDROID_API__ >= 30)
@@ -513,7 +518,7 @@ Dynamic _hx_std_sys_stat( String path )
    hx::EnterGCFreeZone();
    bool err = false;
    // ctime is the creation time, as on Windows, where the file system records one
-   int ctime = 0;
+   double ctime = 0;
    #if defined(NEKO_WINDOWS)
       struct _stat s;
       #if defined(HX_SMART_STRINGS)
@@ -528,20 +533,20 @@ Dynamic _hx_std_sys_stat( String path )
          hx::strbuf buf;
          err = _stat(path.utf8_str(&buf),&s);
       }
-      ctime = (int)s.st_ctime;
+      ctime = (double)s.st_ctime;
    #else
       struct stat s;
       hx::strbuf buf;
       const char *utf8 = path.utf8_str(&buf);
       err = stat(utf8,&s);
-      ctime = (int)s.st_ctime;
+      ctime = (double)s.st_ctime;
       #if defined(HX_STATX)
       struct statx sx;
       if (!err && statx(AT_FDCWD,utf8,0,STATX_BTIME,&sx)==0 && (sx.stx_mask & STATX_BTIME))
-         ctime = (int)sx.stx_btime.tv_sec;
+         ctime = (double)sx.stx_btime.tv_sec;
       #elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__)
       if (s.st_birthtime>0)
-         ctime = (int)s.st_birthtime;
+         ctime = (double)s.st_birthtime;
       #endif
    #endif
 
@@ -552,8 +557,8 @@ Dynamic _hx_std_sys_stat( String path )
 
    STATF(gid);
    STATF(uid);
-   STATF(atime);
-   STATF(mtime);
+   STATT(atime);
+   STATT(mtime);
    o->Add(HX_CSTRING("ctime"),ctime);
    STATF(dev);
    STATF(ino);
@@ -753,37 +758,27 @@ double _hx_std_sys_cpu_time()
 Array<String> _hx_std_sys_read_dir( String p )
 {
    Array<String> result = Array_obj<String>::__new();
+   // An enumeration that fails part way throws, where it gave the entries
+   // read so far as if they were all of them
+   bool failed = false;
 
 #if defined(NEKO_WINDOWS)
-   const wchar_t *path = p.wchar_str();
-   size_t len = wcslen(path);
-   if (len>MAX_PATH)
-      hx::Throw(HX_CSTRING("Invalid directory"));
+   // Sized to the path: a fixed MAX_PATH buffer threw for a longer one,
+   // such as a \\?\ path, before Windows saw it. The pattern goes after a
+   // backslash, as \\?\ paths take no forward slashes
+   std::wstring searchPath(p.wchar_str());
+   size_t len = searchPath.size();
+   if( len && searchPath[len-1] != '/' && searchPath[len-1] != '\\' )
+      searchPath += L'\\';
+   searchPath += L"*.*";
 
    WIN32_FIND_DATAW d;
    HANDLE handle;
-  #if defined(HX_WINRT) && !defined(_XBOX_ONE)
-   std::wstring tempWStr(path);
-   std::string searchPath(tempWStr.begin(), tempWStr.end());
-  #else
-   // Worst case append below is "/*.*" plus the terminator - five wchars
-   wchar_t searchPath[ MAX_PATH + 5 ];
-   memcpy(searchPath,path, len*sizeof(wchar_t));
-  #endif
-
-
-   if( len && path[len-1] != '/' && path[len-1] != '\\' )
-      searchPath[len++] = '/';
-   searchPath[len++] = '*';
-   searchPath[len++] = '.';
-   searchPath[len++] = '*';
-   searchPath[len] = '\0';
-
    hx::EnterGCFreeZone();
   #if defined(HX_WINRT) && !defined(_XBOX_ONE)
-   handle = FindFirstFileEx(searchPath.c_str(), FindExInfoStandard, &d, FindExSearchNameMatch, NULL, 0);
+   handle = FindFirstFileExW(searchPath.c_str(), FindExInfoStandard, &d, FindExSearchNameMatch, NULL, 0);
   #else
-   handle = FindFirstFileW(searchPath,&d);
+   handle = FindFirstFileW(searchPath.c_str(),&d);
   #endif
    if( handle == INVALID_HANDLE_VALUE )
    {
@@ -800,7 +795,10 @@ Array<String> _hx_std_sys_read_dir( String p )
          hx::EnterGCFreeZone();
       }
       if( !FindNextFileW(handle,&d) )
+      {
+         failed = GetLastError() != ERROR_NO_MORE_FILES;
          break;
+      }
    }
    FindClose(handle);
 #elif !defined(EPPC)
@@ -814,9 +812,15 @@ Array<String> _hx_std_sys_read_dir( String p )
    }
    while( true )
    {
+      // Only errno tells the end from a failure, and the push below can
+      // change it, so it is cleared before each read
+      errno = 0;
       struct dirent *e = readdir(d);
       if( e == NULL )
+      {
+         failed = errno != 0;
          break;
+      }
       // skip magic dirs
       if( e->d_name[0] == '.' && (e->d_name[1] == 0 || (e->d_name[1] == '.' && e->d_name[2] == 0)) )
          continue;
@@ -827,6 +831,8 @@ Array<String> _hx_std_sys_read_dir( String p )
    closedir(d);
 #endif
    hx::ExitGCFreeZone();
+   if( failed )
+      hx::Throw(HX_CSTRING("Error reading directory"));
 
    return result;
 }
@@ -870,10 +876,20 @@ String _hx_std_sys_exe_path()
    Windows::Storage::StorageFolder^ installedLocation = package->InstalledLocation;
    return(String::create(installedLocation->Path->Data()));
 #elif defined(NEKO_WINDOWS)
-   wchar_t path[MAX_PATH];
-   if( GetModuleFileNameW(NULL,path,MAX_PATH) == 0 )
-      return null();
-   return String::create(path);
+   // A path that fills the buffer was cut short, so grow it and ask again:
+   // a MAX_PATH buffer gave the first 259 characters of a longer path
+   std::vector<wchar_t> path(MAX_PATH);
+   while( true )
+   {
+      DWORD len = GetModuleFileNameW(NULL,&path[0],(DWORD)path.size());
+      if( len == 0 )
+         return null();
+      if( len < path.size() )
+         return String::create(&path[0],len);
+      if( path.size() >= 32768 )
+         return null();
+      path.resize(path.size()*2);
+   }
 #elif defined(NEKO_MAC) && !defined(IPHONE) && !defined(APPLETV) && !defined(HX_APPLEWATCH)
    char path[PATH_MAX+1];
    uint32_t path_len = PATH_MAX;

@@ -1,6 +1,7 @@
 #if !defined(HX_WINRT) && !defined(EPPC)
 #include <hxcpp.h>
 #include <chrono>
+#include <atomic>
 #include <hx/OS.h>
 
 #include <string.h>
@@ -26,6 +27,31 @@
 #define DYNAMIC_INET_FUNCS 1
 typedef INT (WSAAPI *inet_pton_func)( INT Family, PCSTR pszAddrString, PVOID pAddrBuf);
 typedef PCSTR (WSAAPI *inet_ntop_func)(INT  Family, PVOID pAddr, PSTR pStringBuf, size_t StringBufSize);
+
+// A WS2_32 function looked up on first use, from any thread. The answer is
+// published only once complete, and a thread that finds none yet looks it
+// up too: a flag set before the lookup let another thread take a lookup
+// still in progress for a missing function, and format ::1 as null.
+struct DynamicInetFunc
+{
+   const char *name;
+   std::atomic<void *> func;
+   std::atomic<bool> tried;
+
+   void *get()
+   {
+      if (!tried.load(std::memory_order_acquire))
+      {
+         void *found = 0;
+         HMODULE module = LoadLibraryA("WS2_32.dll");
+         if (module)
+            found = (void *)GetProcAddress(module,name);
+         func.store(found, std::memory_order_relaxed);
+         tried.store(true, std::memory_order_release);
+      }
+      return func.load(std::memory_order_relaxed);
+   }
+};
 
 // fd_array does not begin at sizeof(u_int). On 64-bit Windows SOCKET is
 // eight bytes, so fd_set carries four bytes of padding after fd_count and
@@ -490,8 +516,7 @@ int _hx_std_host_resolve( String host )
 }
 
 #ifdef DYNAMIC_INET_FUNCS
-bool dynamic_inet_pton_tried = false;
-inet_pton_func dynamic_inet_pton = 0;
+static DynamicInetFunc dynamic_inet_pton = { "inet_pton" };
 #endif
 
 Array<unsigned char> _hx_std_host_resolve_ipv6( String host, bool )
@@ -501,14 +526,8 @@ Array<unsigned char> _hx_std_host_resolve_ipv6( String host, bool )
    hx::strbuf hostBuf;
    const char *hostStr = host.utf8_str(&hostBuf);
    #ifdef DYNAMIC_INET_FUNCS
-   if (!dynamic_inet_pton_tried)
-   {
-      dynamic_inet_pton_tried = true;
-      HMODULE module = LoadLibraryA("WS2_32.dll");
-      if (module)
-         dynamic_inet_pton = (inet_pton_func)GetProcAddress(module,"inet_pton");
-   }
-   int ok = dynamic_inet_pton ? dynamic_inet_pton(AF_INET6, hostStr, (void *)&ipv6) : 0;
+   inet_pton_func pton = (inet_pton_func)dynamic_inet_pton.get();
+   int ok = pton ? pton(AF_INET6, hostStr, (void *)&ipv6) : 0;
    #else
    int ok = inet_pton(AF_INET6, hostStr, (void *)&ipv6);
    #endif
@@ -588,8 +607,7 @@ String _hx_std_host_to_string( int ip )
 
 
 #ifdef DYNAMIC_INET_FUNCS
-bool dynamic_inet_ntop_tried = false;
-inet_ntop_func dynamic_inet_ntop = 0;
+static DynamicInetFunc dynamic_inet_ntop = { "inet_ntop" };
 #endif
 
 
@@ -597,16 +615,10 @@ String _hx_std_host_to_string_ipv6( Array<unsigned char> ip )
 {
    char buf[100];
    #ifdef DYNAMIC_INET_FUNCS
-   if (!dynamic_inet_ntop_tried)
-   {
-      dynamic_inet_ntop_tried = true;
-      HMODULE module = LoadLibraryA("WS2_32.dll");
-      if (module)
-         dynamic_inet_ntop = (inet_ntop_func)GetProcAddress(module,"inet_ntop");
-   }
-   if (!dynamic_inet_ntop)
+   inet_ntop_func ntop = (inet_ntop_func)dynamic_inet_ntop.get();
+   if (!ntop)
       return String();
-   return String( dynamic_inet_ntop(AF_INET6, &ip[0], buf, 100) );
+   return String( ntop(AF_INET6, &ip[0], buf, 100) );
    #else
    return String( inet_ntop(AF_INET6, &ip[0], buf, 100) );
    #endif
@@ -838,11 +850,16 @@ static struct timeval *init_timeval( double f, struct timeval *t ) {
    return t;
 }
 
-#ifdef NEKO_POSIX
+// Not only NEKO_POSIX: poll_events uses it on every non-Windows system,
+// Emscripten included
+#ifndef NEKO_WINDOWS
 static double monotonicSeconds()
 {
    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+#endif
+
+#ifdef NEKO_POSIX
 
 // A finite wait that a signal interrupted goes on for what is left of it,
 // not for its whole length again
@@ -1067,7 +1084,9 @@ void _hx_std_socket_bind_ipv6( Dynamic o, Array<unsigned char> host, int port )
 Dynamic _hx_std_socket_accept( Dynamic o )
 {
    SOCKET sock = val_sock(o);
-   struct sockaddr_in addr;
+   // Room for any family's peer address: an IPv6 one does not fit a
+   // sockaddr_in, and Windows fails the accept with WSAEFAULT
+   struct sockaddr_storage addr;
    SockLen addrlen = sizeof(addr);
    SOCKET s;
    hx::EnterGCFreeZone();
@@ -1315,6 +1334,9 @@ struct polldata : public hx::Object
    struct fd_set *fdw;
    struct fd_set *outr;
    struct fd_set *outw;
+   // The exception set: every read socket, then every write socket. Windows
+   //  reports a failed nonblocking connect only there
+   struct fd_set *oute;
    #else
    struct pollfd *fds;
    int rcount;
@@ -1322,6 +1344,11 @@ struct polldata : public hx::Object
    #endif
    Array<int> ridx;
    Array<int> widx;
+   // The sockets registered by the last prepare: the poll holds their
+   //  descriptors, so it must keep them, or a collection could finalize one
+   //  and close the connection while it is still being polled
+   Array<Dynamic> rsockets;
+   Array<Dynamic> wsockets;
 
    void create(int nsocks)
    {
@@ -1332,6 +1359,7 @@ struct polldata : public hx::Object
       fdw = (fd_set*)malloc(FDSIZE(max));
       outr = (fd_set*)malloc(FDSIZE(max));
       outw = (fd_set*)malloc(FDSIZE(max));
+      oute = (fd_set*)malloc(FDSIZE(max));
       fdr->fd_count = 0;
       fdw->fd_count = 0;
 
@@ -1364,6 +1392,7 @@ struct polldata : public hx::Object
          free(fdw);
          free(outr);
          free(outw);
+         free(oute);
          #else
          // ???
          free(fds);
@@ -1371,9 +1400,21 @@ struct polldata : public hx::Object
       }
    }
 
-   void __Mark(hx::MarkContext *__inCtx) HXCPP_OVERRIDE { HX_MARK_MEMBER(ridx); HX_MARK_MEMBER(widx); }
+   void __Mark(hx::MarkContext *__inCtx) HXCPP_OVERRIDE
+   {
+      HX_MARK_MEMBER(ridx);
+      HX_MARK_MEMBER(widx);
+      HX_MARK_MEMBER(rsockets);
+      HX_MARK_MEMBER(wsockets);
+   }
    #ifdef HXCPP_VISIT_ALLOCS
-   void __Visit(hx::VisitContext *__inCtx) HXCPP_OVERRIDE { HX_VISIT_MEMBER(ridx); HX_VISIT_MEMBER(widx); }
+   void __Visit(hx::VisitContext *__inCtx) HXCPP_OVERRIDE
+   {
+      HX_VISIT_MEMBER(ridx);
+      HX_VISIT_MEMBER(widx);
+      HX_VISIT_MEMBER(rsockets);
+      HX_VISIT_MEMBER(wsockets);
+   }
    #endif
 
    int __GetType() const HXCPP_OVERRIDE { return pollType; }
@@ -1425,6 +1466,13 @@ Array<Dynamic> _hx_std_socket_poll_prepare( Dynamic pdata, Array<Dynamic> rsocks
    int wlen = wsocks.mPtr ? wsocks->length : 0;
    if( len + wlen > p->max )
       hx::Throw(HX_CSTRING("Too many sockets in poll"));
+
+   // Copies, so that a caller changing its arrays afterwards cannot drop a
+   //  socket the poll still has the descriptor of
+   p->rsockets = len ? rsocks->copy() : null();
+   HX_OBJ_WB_GET(p, p->rsockets.mPtr);
+   p->wsockets = wlen ? wsocks->copy() : null();
+   HX_OBJ_WB_GET(p, p->wsockets.mPtr);
 
    #ifdef NEKO_WINDOWS
    for(int i=0;i<len;i++)
@@ -1478,19 +1526,39 @@ void _hx_std_socket_poll_events(Dynamic pdata, double timeout)
    p->widx[0] = -1;
 
 #ifdef NEKO_WINDOWS
+   // Winsock's select fails at once with no sockets, which looked like an
+   // empty poll done: an event loop with nothing registered spun at full CPU.
+   // With nothing to wait for, wait out the timeout, as poll does elsewhere.
+   if (p->fdr->fd_count == 0 && p->fdw->fd_count == 0)
+   {
+      DWORD ms = INFINITE;
+      if (timeout >= 0)
+         ms = timeout * 1000 >= (double)(INFINITE - 1) ? INFINITE - 1 : (DWORD)ceil(timeout * 1000);
+      if (ms)
+      {
+         hx::EnterGCFreeZone();
+         Sleep(ms);
+         hx::ExitGCFreeZone();
+      }
+      return;
+   }
+
    memcpy(p->outr, p->fdr, FDSIZE(p->fdr->fd_count));
    memcpy(p->outw, p->fdw, FDSIZE(p->fdw->fd_count));
 
-   // The exception set takes the first FD_SETSIZE read sockets, as FD_SET
-   // filled it - copied, since FD_SET searches the set for a duplicate on
-   // every add and the sockets here are distinct already.
-   fd_set oute;
-   FD_ZERO(&oute);
+   // The exception set is every read socket, then every write socket: a
+   // failed connect is reported only there, for a socket polled for reading
+   // or for writing. It was a stack fd_set of the first FD_SETSIZE (64) read
+   // sockets, so a failed socket after them, or one polled only for writing,
+   // was never reported.
+   fd_set *oute = p->oute;
    {
-      u_int count = p->fdr->fd_count < FD_SETSIZE ? p->fdr->fd_count : FD_SETSIZE;
-      for (u_int i = 0; i < count; ++i)
-         oute.fd_array[i] = p->fdr->fd_array[i];
-      oute.fd_count = count;
+      u_int count = 0;
+      for (u_int i = 0; i < p->fdr->fd_count; ++i)
+         oute->fd_array[count++] = p->fdr->fd_array[i];
+      for (u_int i = 0; i < p->fdw->fd_count; ++i)
+         oute->fd_array[count++] = p->fdw->fd_array[i];
+      oute->fd_count = count;
    }
 
    struct timeval t;
@@ -1501,7 +1569,7 @@ void _hx_std_socket_poll_events(Dynamic pdata, double timeout)
        0,
        p->fdr->fd_count ? p->outr : 0,
        p->fdw->fd_count ? p->outw : 0,
-       p->fdr->fd_count ? &oute : 0,
+       oute->fd_count ? oute : 0,
        tt);
    if (sel == SOCKET_ERROR)
    {
@@ -1525,9 +1593,11 @@ void _hx_std_socket_poll_events(Dynamic pdata, double timeout)
    // half of them ready. Should a set come back in another order the walk
    // misses some, and that pass is decided by FD_ISSET as it always was.
    int k = 0;
+   // The exception set's ready sockets, in order: the read sockets' first
+   u_int e = 0;
    {
       fd_set *ready = p->outr;
-      u_int r = 0, e = 0;
+      u_int r = 0;
       for (u_int i = 0; i < p->fdr->fd_count; ++i)
       {
          SOCKET fd = p->fdr->fd_array[i];
@@ -1537,7 +1607,7 @@ void _hx_std_socket_poll_events(Dynamic pdata, double timeout)
             hit = true;
             r++;
          }
-         if (e < oute.fd_count && oute.fd_array[e] == fd)
+         if (e < oute->fd_count && oute->fd_array[e] == fd)
          {
             hit = true;
             e++;
@@ -1545,13 +1615,15 @@ void _hx_std_socket_poll_events(Dynamic pdata, double timeout)
          if (hit)
             p->ridx[k++] = i;
       }
-      if (r != ready->fd_count || e != oute.fd_count)
+      if (r != ready->fd_count)
+         e = oute->fd_count + 1;
+      if (e > oute->fd_count)
       {
          k = 0;
          for (u_int i = 0; i < p->fdr->fd_count; ++i)
          {
             SOCKET fd = p->fdr->fd_array[i];
-            if (FD_ISSET(fd, p->outr) || FD_ISSET(fd, &oute))
+            if (FD_ISSET(fd, p->outr) || FD_ISSET(fd, oute))
                p->ridx[k++] = i;
          }
       }
@@ -1564,18 +1636,28 @@ void _hx_std_socket_poll_events(Dynamic pdata, double timeout)
       u_int w = 0;
       for (u_int i = 0; i < p->fdw->fd_count; ++i)
       {
-         if (w < ready->fd_count && ready->fd_array[w] == p->fdw->fd_array[i])
+         SOCKET fd = p->fdw->fd_array[i];
+         bool hit = false;
+         if (w < ready->fd_count && ready->fd_array[w] == fd)
          {
-            p->widx[k++] = i;
+            hit = true;
             w++;
          }
+         if (e < oute->fd_count && oute->fd_array[e] == fd)
+         {
+            hit = true;
+            e++;
+         }
+         if (hit)
+            p->widx[k++] = i;
       }
-      if (w != ready->fd_count)
+      if (w != ready->fd_count || e != oute->fd_count)
       {
          k = 0;
          for (u_int i = 0; i < p->fdw->fd_count; ++i)
          {
-            if (FD_ISSET(p->fdw->fd_array[i], p->outw))
+            SOCKET fd = p->fdw->fd_array[i];
+            if (FD_ISSET(fd, p->outw) || FD_ISSET(fd, oute))
                p->widx[k++] = i;
          }
       }

@@ -170,9 +170,16 @@ public:
    }
    hx::Val __SetField(const String &inName,const hx::Val &inValue, hx::PropertyAccess inCallProp) HXCPP_OVERRIDE
    {
+      // Boxes from -1 to 255 are constants every boxing of that value shares,
+      //  so writing one would change all of them: only a box of its own can change
+      if ( (HX_FIELD_EQ(inName,"hi") || HX_FIELD_EQ(inName,"lo")) &&
+           (((unsigned int *)this)[-1] & HX_GC_CONST_ALLOC_BIT) )
+         hx::Throw( HX_CSTRING("Cannot change a shared boxed Int64 constant") );
       if (HX_FIELD_EQ(inName,"hi") )
       {
-         mValue = (int)(mValue & 0xffffffff) | (cpp::Int64(inValue.Cast< int >())<<32);
+         // Combined unsigned, so a low word with its top bit set is not
+         //  sign-extended over the new high word
+         mValue = (cpp::Int64)( ((cpp::UInt64)(unsigned int)inValue.Cast< int >() << 32) | (cpp::UInt64)(unsigned int)mValue );
          return inValue;
       }
       if (HX_FIELD_EQ(inName,"lo") )
@@ -384,8 +391,9 @@ Dynamic::Dynamic(short inVal)
    mPtr = fromInt(inVal);
 }
 
-#if !defined(__GNUC__) || defined(__MINGW32__) || defined(__APPLE__) || (defined(__WORDSIZE) && (__WORDSIZE != 64))
-// long is 64 bits on 64-bit macOS, where int64_t is long long
+#if !defined(__GNUC__) || defined(__MINGW32__) || defined(__APPLE__) || defined(__EMSCRIPTEN__) || (defined(__WORDSIZE) && (__WORDSIZE != 64))
+// long is 64 bits on 64-bit macOS, where int64_t is long long. Emscripten
+// defines no __WORDSIZE, and there long is 32 bits but not int
 Dynamic::Dynamic(unsigned long inVal)
 {
    mPtr = inVal==(unsigned int)inVal ? fromInt((unsigned int)inVal) : Dynamic((cpp::UInt64)inVal).mPtr;

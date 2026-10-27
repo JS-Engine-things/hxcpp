@@ -32,22 +32,24 @@ namespace
 	const char* sohName = "Small Object Heap";
 	const char* lohName = "Large Object Heap";
 
-	std::vector<hx::Telemetry*> created;
-	std::mutex createdLock;
+	// Never destroyed, so a thread still running at exit cannot use them after
+	// their destructors ran (#371)
+	std::vector<hx::Telemetry*> &created = *new std::vector<hx::Telemetry*>();
+	std::mutex &createdLock = *new std::mutex();
 
-	hx::QuickVec<void*> largeAllocs;
-	std::mutex largeAllocsLock;
+	hx::QuickVec<void*> &largeAllocs = *new hx::QuickVec<void*>();
+	std::mutex &largeAllocsLock = *new std::mutex();
 
 	// Hold a reference to small objects when their thread is destroyed, until Tracy can learn they've been freed.
 	// Only used by tlmDestroy and GC sweep, which both run under the gThreadStateChangeLock mutex.
-	hx::QuickVec<void*> orphanedSmallAllocs;
+	hx::QuickVec<void*> &orphanedSmallAllocs = *new hx::QuickVec<void*>();
 
 	// Tracy receives name pointers from HXCPP and reads them from its thread.
 	// If the pointer is then freed, Tracy can't identify the frame set or plot.
 	// (This is mainly an issue for non-ASCII strings!)
 	// We use a set so each unique name is only stored once, and never free it so Tracy can read the names while the program is shutting down.
 	std::unordered_set<std::string>* internedNames = new std::unordered_set<std::string>();
-	std::mutex internedNamesLock;
+	std::mutex &internedNamesLock = *new std::mutex();
 
 	// Store the provided name as a UTF-8 pointer that Tracy can always access.
 	const char* internName(const String& name)

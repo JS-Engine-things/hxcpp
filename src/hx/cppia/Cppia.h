@@ -54,6 +54,25 @@ struct CppiaExpr;
 struct CppiaStream;
 struct CppiaStackVar;
 struct StackLayout;
+
+// The jit passes some values to native helpers by address, and the address can
+//  be a frame slot or a jit temporary, which can be unaligned (see
+//  StackContext::getSlot), so helpers read and write through these
+template<typename T> inline T JitLoad(const T *inPtr) { return StackContext::getSlot<T>(inPtr); }
+// Assigns as `*outPtr = inValue` would, with the same conversion
+template<typename T, typename V> inline void JitStore(T *outPtr, const V &inValue)
+{
+   T value;
+   value = inValue;
+   StackContext::setSlot(outPtr, value);
+}
+
+// One argument of a block the jit passes to a native helper, copied out
+template<typename A> inline A JitArg(const A *inArgs, int inIndex)
+{
+   return StackContext::getSlot<A>((const char *)inArgs + inIndex*sizeof(A));
+}
+
 struct ScriptCallable;
 class  ScriptRegistered;
 class  HaxeNativeClass;
@@ -413,6 +432,10 @@ public:
    const char                      *creatingFunction;
    int                             scriptId;
 
+   // What the script uses that the host does not have, found while linking.
+   //  Linking goes on past each one, so the load fails once, naming them all
+   std::vector< std::string >      linkMisses;
+
    ScriptCallable                  *main;
    std::vector< hx::Resource >     resources;
 
@@ -435,6 +458,7 @@ public:
    void setDebug(CppiaExpr *outExpr, int inFileId, int inLine);
    void boot(CppiaCtx *ctx);
    void where(CppiaExpr *e);
+   void linkMiss(CppiaExpr *inWhere, const std::string &inWhat);
    void mark(hx::MarkContext *ctx);
    void visit(hx::VisitContext *ctx);
    int  getInterfaceSlot(const std::string &inName);

@@ -6,9 +6,71 @@
 
 #include "sljit_src/sljitLir.c"
 
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+   #include <pthread.h>
+   #define HX_JIT_WRITE_PROTECT
+#endif
+
 
 namespace hx
 {
+
+// On Apple Silicon, MAP_JIT memory is either writable or executable for the
+// current thread, never both: generating or freeing code makes it writable for
+// that long, and executable again before anything runs it.
+struct JitWritable
+{
+   JitWritable() { set(true); }
+   ~JitWritable() { set(false); }
+   static void set(bool inWritable)
+   {
+      #ifdef HX_JIT_WRITE_PROTECT
+      if (__builtin_available(macOS 11.0, iOS 14.0, tvOS 14.0, *))
+         pthread_jit_write_protect_np(inWritable ? 0 : 1);
+      #endif
+   }
+};
+
+bool CppiaCompiler::canRun()
+{
+   static int sCanRun = -1;
+   if (sCanRun<0)
+   {
+      #if (defined SLJIT_EXECUTABLE_ALLOCATOR && SLJIT_EXECUTABLE_ALLOCATOR)
+      // A chunk mapped and released as sljit's allocator maps its own, MAP_JIT
+      //  included. Allocating through the allocator left its free list as if a
+      //  function had been made and freed, which moved where every later
+      //  function went, and cost jitted loops and calls about 9% on Windows
+      void *probe = alloc_chunk(CHUNK_SIZE);
+      if (probe)
+         free_chunk(probe, CHUNK_SIZE);
+      #else
+      JitWritable writable;
+      void *probe = SLJIT_MALLOC_EXEC(16);
+      if (probe)
+         SLJIT_FREE_EXEC(probe);
+      #endif
+      sCanRun = probe ? 1 : 0;
+   }
+   return sCanRun==1;
+}
+
+// On stderr where there is one, since stdout is the program's own output
+#ifdef HX_ANDROID
+#define JIT_NOTICE CPPIALOG
+#else
+#define JIT_NOTICE(...) fprintf(stderr, __VA_ARGS__)
+#endif
+
+void CppiaCompiler::reportCannotRun()
+{
+   static bool sReported = false;
+   if (!sReported)
+   {
+      sReported = true;
+      JIT_NOTICE("cppia: the JIT is enabled but cannot get executable memory here, so scripts run in the interpreter\n");
+   }
+}
 
 static void SLJIT_CALL my_trace_func(const char *inText)
 {
@@ -20,7 +82,7 @@ static void SLJIT_CALL my_trace_strings(const char *inText, const char *inValue)
 }
 static void SLJIT_CALL my_trace_string(const char *inText, String *inValue)
 {
-   printf("%s%s\n", inText, inValue->out_str());
+   printf("%s%s\n", inText, JitLoad(inValue).out_str());
 }
 
 static void SLJIT_CALL my_trace_ptr_func(const char *inText, hx::Object **inPtr)
@@ -35,7 +97,7 @@ static void SLJIT_CALL my_trace_int_func(const char *inText, int inValue)
 }
 static void SLJIT_CALL my_trace_float_func(const char *inText, double *inValue)
 {
-   printf("%s = %f\n",inText, *inValue);
+   printf("%s = %f\n",inText, JitLoad(inValue));
 }
 
 static void SLJIT_CALL my_trace_obj_func(const char *inText, hx::Object *inPtr)
@@ -49,11 +111,11 @@ static hx::Object *SLJIT_CALL intToObj(int inVal)
 }
 static void SLJIT_CALL intToStr(int inVal, String *outString)
 {
-   *outString = String(inVal);
+   JitStore(outString, String(inVal));
 }
 static void SLJIT_CALL objToStr(hx::Object *inVal, String *outString)
 {
-   *outString = inVal ? inVal->toString() : String();
+   JitStore(outString, inVal ? inVal->toString() : String());
 }
 int SLJIT_CALL objToInt(hx::Object *inVal)
 {
@@ -61,53 +123,55 @@ int SLJIT_CALL objToInt(hx::Object *inVal)
 }
 static void SLJIT_CALL objToFloat(hx::Object *inVal,double *outFloat)
 {
-   *outFloat =  inVal ? inVal->__ToDouble() : 0.0;
+   JitStore(outFloat, inVal ? inVal->__ToDouble() : 0.0);
 }
 
 static void *SLJIT_CALL strToObj(String *inStr)
 {
-   return Dynamic(*inStr).mPtr;
+   return Dynamic(JitLoad(inStr)).mPtr;
 }
 static void *SLJIT_CALL floatToObj(double *inDouble)
 {
-   return Dynamic(*inDouble).mPtr;
+   return Dynamic(JitLoad(inDouble)).mPtr;
 }
 
 static void SLJIT_CALL floatToStr(double *inDouble, String *outStr)
 {
-   *outStr = String(*inDouble);
+   JitStore(outStr, String(JitLoad(inDouble)));
 
 }
 
 static hx::Object * SLJIT_CALL variantToObject(cpp::Variant *inVariant)
 {
-   return Dynamic( *inVariant ).mPtr;
+   return Dynamic( JitLoad(inVariant) ).mPtr;
 }
 
 
 static int SLJIT_CALL variantToInt(cpp::Variant *inVariant)
 {
-   return *inVariant;
+   return JitLoad(inVariant);
 }
 
 static void SLJIT_CALL variantToFloat(cpp::Variant *inVariant, double *outValue)
 {
-   *outValue = *inVariant;
+   JitStore(outValue, (double)JitLoad(inVariant));
 }
 
 static void SLJIT_CALL variantToString(cpp::Variant *inVariant, String *outValue)
 {
-   *outValue = *inVariant;
+   String value;
+   value = JitLoad(inVariant);
+   JitStore(outValue, value);
 }
 
 static int SLJIT_CALL strEqual(const String *inS0, const String *inS1)
 {
-   return *inS0 == *inS1;
+   return JitLoad(inS0) == JitLoad(inS1);
 }
 
 static int SLJIT_CALL strNotEqual(const String *inS0, const String *inS1)
 {
-   return *inS0 != *inS1;
+   return JitLoad(inS0) != JitLoad(inS1);
 }
 
 
@@ -359,7 +423,11 @@ public:
          onReturn(this, onReturnStackSize);
 
       sljit_emit_return(compiler, SLJIT_UNUSED, SLJIT_UNUSED, 0);
-      CppiaFunc func = (CppiaFunc)sljit_generate_code(compiler);
+      CppiaFunc func;
+      {
+         JitWritable writable;
+         func = (CppiaFunc)sljit_generate_code(compiler);
+      }
       sljit_free_compiler(compiler);
       compiler = 0;
       return func;
@@ -1565,6 +1633,8 @@ public:
 
 void CppiaCompiler::freeCompiled(CppiaFunc inFunc)
 {
+   // The allocator keeps its free list inside the executable chunks
+   JitWritable writable;
    sljit_free_code((void *)inFunc);
 }
 

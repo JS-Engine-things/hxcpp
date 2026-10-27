@@ -499,12 +499,31 @@ typedef ImmixAllocator Ctx;
 #endif
 
 #define HX_OBJ_WB(obj,value) HX_OBJ_WB_CTX(obj,value,_hx_ctx)
-#define HX_ARRAY_WB(array,index,value) HX_OBJ_WB(array,value)
+#ifdef HXCPP_GC_GENERATIONAL
+  // Storing a young value in an old array: see ArrayYoungStore
+  #define HX_ARRAY_WB(array,index,value) { \
+        unsigned char mark =  ((unsigned char *)(array))[ HX_ENDIAN_MARK_ID_BYTE]; \
+        if (mark == ::hx::gByteMarkID && value && !((unsigned char *)(value))[ HX_ENDIAN_MARK_ID_BYTE  ] ) \
+           ::hx::ArrayYoungStore(array, value, _hx_ctx); \
+     }
+#else
+  #define HX_ARRAY_WB(array,index,value)
+#endif
 #define HX_OBJ_WB_PESSIMISTIC(obj) HX_OBJ_WB_PESSIMISTIC_CTX(obj,_hx_ctx)
 #define HX_OBJ_WB_GET(obj,value) HX_OBJ_WB_CTX(obj,value,HX_CTX_GET)
 #define HX_OBJ_WB_PESSIMISTIC_GET(obj) HX_OBJ_WB_PESSIMISTIC_CTX(obj,HX_CTX_GET)
 
 HXCPP_EXTERN_CLASS_ATTRIBUTES extern unsigned int gPrevMarkIdMask;
+
+#ifdef HXCPP_GC_GENERATIONAL
+class ArrayBase;
+// The write barrier's slow path for young values stored in an old container
+//  with inLength elements: logs those of inValues that are young, or
+//  remembers inOwner whole. ioLogged is the container's count for the cycle
+HXCPP_EXTERN_CLASS_ATTRIBUTES void YoungStore(hx::Object *inOwner, unsigned int &ioLogged, int inLength, const void *const *inValues, int inCount, StackContext *inCtx);
+// The same for one value stored in an old array
+HXCPP_EXTERN_CLASS_ATTRIBUTES void ArrayYoungStore(ArrayBase *inArray, const void *inValue, StackContext *inCtx);
+#endif
 
 // Called only once it is determined that a new mark is required
 HXCPP_EXTERN_CLASS_ATTRIBUTES void MarkAllocUnchecked(void *inPtr ,hx::MarkContext *__inCtx); 

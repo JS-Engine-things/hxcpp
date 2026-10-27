@@ -197,6 +197,10 @@ struct vprocess : public hx::Object
    HANDLE eread;
    HANDLE iwrite;
    PROCESS_INFORMATION pinf;
+   // Threads inside ReadFile or WriteFile on the pipes, and whether close has
+   // begun: see PipeCall
+   std::atomic<int> pipeCalls;
+   std::atomic<bool> closing;
    #define HANDLE_INIT 0
 #else
    int oread;
@@ -214,7 +218,10 @@ struct vprocess : public hx::Object
       oread = HANDLE_INIT;
       eread = HANDLE_INIT;
       iwrite = HANDLE_INIT;
-      #ifndef NEKO_WINDOWS
+      #ifdef NEKO_WINDOWS
+      pipeCalls = 0;
+      closing = false;
+      #else
       reaped = false;
       exitStatus = 0;
       #endif
@@ -226,6 +233,21 @@ struct vprocess : public hx::Object
       if (open)
       {
          #ifdef NEKO_WINDOWS
+            // CloseHandle on a pipe waits for a ReadFile or WriteFile in
+            // progress on it in another thread, and a descendant of the child
+            // that inherited the pipe can keep that going for as long as it
+            // lives (libhxcpp #261). New calls are refused from here, and the
+            // ones in progress are cancelled until none is left: one that had
+            // taken its handle but not yet entered ReadFile misses the first
+            // cancel, so it is retried.
+            closing = true;
+            for(int spins=0; pipeCalls>0; spins++)
+            {
+               if (oread) CancelIoEx(oread, 0);
+               if (eread) CancelIoEx(eread, 0);
+               if (iwrite) CancelIoEx(iwrite, 0);
+               Sleep(spins<10 ? 0 : 1);
+            }
             if (eread)
                CloseHandle(eread);
             if (oread)
@@ -277,6 +299,24 @@ struct vprocess : public hx::Object
 
    String toString() HXCPP_OVERRIDE { return HX_CSTRING("vprocess"); }
 };
+
+#ifdef NEKO_WINDOWS
+// Counts a ReadFile or WriteFile on one of the process's pipes for close, which
+// cancels it before closing the handles. The count goes up before closing is
+// checked, so close either sees the call and waits for it, or the call sees
+// close and is refused.
+struct PipeCall
+{
+   vprocess *process;
+   HANDLE handle;
+   PipeCall(vprocess *inProcess, HANDLE inHandle) : process(inProcess)
+   {
+      process->pipeCalls++;
+      handle = process->closing ? 0 : inHandle;
+   }
+   ~PipeCall() { process->pipeCalls--; }
+};
+#endif
 
 vprocess *getProcess(Dynamic handle)
 {
@@ -383,6 +423,39 @@ static String quoteString(String v)
 static void startFailed(int inErr)
 {
    hx::Throw(HX_CSTRING("Could not start process: ") + String(strerror(inErr)));
+}
+
+// A child forked by another thread between pipe() and FD_CLOEXEC kept the
+// pipe ends across exec, so one process's stdout could stay open in an
+// unrelated child and never deliver EOF.  pipe2 creates the ends with
+// close-on-exec already set.  Where it is missing (macOS) or the kernel lacks
+// it, the ends are created and flagged under sForkLock held shared, and this
+// runtime forks under it held exclusively, so none of its own forks lands in
+// between
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+#define HX_PROCESS_HAS_PIPE2
+#endif
+static pthread_rwlock_t sForkLock = PTHREAD_RWLOCK_INITIALIZER;
+
+static int cloexecPipe(int outFds[2])
+{
+   #ifdef HX_PROCESS_HAS_PIPE2
+   if (pipe2(outFds, O_CLOEXEC) == 0)
+      return 0;
+   if (errno != ENOSYS)
+      return -1;
+   #endif
+   pthread_rwlock_rdlock(&sForkLock);
+   int result = pipe(outFds);
+   if (result == 0)
+   {
+      fcntl(outFds[0], F_SETFD, FD_CLOEXEC);
+      fcntl(outFds[1], F_SETFD, FD_CLOEXEC);
+   }
+   int err = errno;
+   pthread_rwlock_unlock(&sForkLock);
+   errno = err;
+   return result;
 }
 #endif
 
@@ -533,42 +606,32 @@ Dynamic _hx_std_process_run( String cmd, Array<String> vargs, int inShowParam )
    }
    #else // not windows ...
    {
-   // The child writes exec's errno to status; a successful exec closes it
+   // The child writes exec's errno to status; a successful exec closes it.
+   // All four are close-on-exec; dup2 onto 0/1/2 in the child clears the
+   // flag on the std fds
    int input[2], output[2], error[2], status[2];
-   if( pipe(input) )
+   if( cloexecPipe(input) )
       startFailed(errno);
-   if( pipe(output) )
+   if( cloexecPipe(output) )
    {
       int err = errno;
       do_close(input[0]); do_close(input[1]);
       startFailed(err);
    }
-   if( pipe(error) )
+   if( cloexecPipe(error) )
    {
       int err = errno;
       do_close(input[0]); do_close(input[1]);
       do_close(output[0]); do_close(output[1]);
       startFailed(err);
    }
-   if( pipe(status) )
+   if( cloexecPipe(status) )
    {
       int err = errno;
       do_close(input[0]); do_close(input[1]);
       do_close(output[0]); do_close(output[1]);
       do_close(error[0]); do_close(error[1]);
       startFailed(err);
-   }
-
-   // Close-on-exec: without it a concurrent spawn's child inherits these
-   // descriptors, holding this child's stdout/stderr write ends open so
-   // its streams never deliver EOF until the unrelated child also exits.
-   // dup2 onto 0/1/2 in the child clears the flag on the std fds
-   for(int i=0;i<2;i++)
-   {
-      fcntl(input[i], F_SETFD, FD_CLOEXEC);
-      fcntl(output[i], F_SETFD, FD_CLOEXEC);
-      fcntl(error[i], F_SETFD, FD_CLOEXEC);
-      fcntl(status[i], F_SETFD, FD_CLOEXEC);
    }
 
    hx::strbuf buf;
@@ -593,7 +656,11 @@ Dynamic _hx_std_process_run( String cmd, Array<String> vargs, int inShowParam )
    for(int i=0;i<values.size();i++)
       argv[i] = values[i].c_str();
 
+   // The child execs or exits holding its copy of the lock
+   pthread_rwlock_wrlock(&sForkLock);
    int pid = fork();
+   if( pid != 0 )
+      pthread_rwlock_unlock(&sForkLock);
    if( pid == -1 )
    {
       int err = errno;
@@ -720,8 +787,11 @@ int _hx_std_process_stdout_read( Dynamic handle, Array<unsigned char> buf, int p
    hx::EnterGCFreeZone();
    #ifdef NEKO_WINDOWS
    DWORD nbytes = 0;
-   if( !ReadFile(p->oread,dest+pos,len,&nbytes,0) )
-      nbytes = 0;
+   {
+      PipeCall call(p, p->oread);
+      if( !call.handle || !ReadFile(call.handle,dest+pos,len,&nbytes,0) )
+         nbytes = 0;
+   }
    #else
    POSIX_LABEL(stdout_read_again);
    int nbytes = read(p->oread,dest + pos,len);
@@ -757,8 +827,11 @@ int _hx_std_process_stderr_read( Dynamic handle, Array<unsigned char> buf, int p
    hx::EnterGCFreeZone();
    #ifdef NEKO_WINDOWS
    DWORD nbytes = 0;
-   if( !ReadFile(p->eread,dest+pos,len,&nbytes,0) )
-      nbytes = 0;
+   {
+      PipeCall call(p, p->eread);
+      if( !call.handle || !ReadFile(call.handle,dest+pos,len,&nbytes,0) )
+         nbytes = 0;
+   }
    #else
    POSIX_LABEL(stderr_read_again);
    int nbytes = read(p->eread,dest + pos,len);
@@ -828,7 +901,12 @@ int _hx_std_process_stdin_write( Dynamic handle, Array<unsigned char> buf, int p
    hx::EnterGCFreeZone();
    #ifdef NEKO_WINDOWS
    DWORD nbytes =0;
-   if( !WriteFile(p->iwrite,src+pos,len,&nbytes,0) )
+   bool written;
+   {
+      PipeCall call(p, p->iwrite);
+      written = call.handle && WriteFile(call.handle,src+pos,len,&nbytes,0);
+   }
+   if( !written )
    {
       hx::ExitGCFreeZone();
       // Returning 0 forever makes haxe.io.Output.writeFullBytes spin -

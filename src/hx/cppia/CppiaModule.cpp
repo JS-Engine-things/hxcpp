@@ -19,7 +19,9 @@ const char **sgNativeNameSlots = 0;
 int sgNativeNameSlotCount = 0;
 
 // Every module not yet freed, loaded or released
-static std::mutex sModuleLock;
+// Allocated once and never destroyed: a thread still running when the
+// process exits could otherwise use it after its destructor ran (#371)
+static std::mutex &sModuleLock = *new std::mutex();
 static std::vector<CppiaModule *> &allModules()
 {
    static std::vector<CppiaModule *> *modules = new std::vector<CppiaModule *>();
@@ -204,6 +206,18 @@ void CppiaModule::link()
 
    if (main)
       main = (ScriptCallable *)main->link(*this);
+
+   if (!linkMisses.empty())
+   {
+      std::string message = "Could not link ";
+      for(size_t i=0;i<linkMisses.size();i++)
+      {
+         if (i)
+            message += ", ";
+         message += linkMisses[i];
+      }
+      hx::Throw( String::create(message.c_str(), (int)message.size()) );
+   }
 }
 
 #ifdef CPPIA_JIT
@@ -232,11 +246,9 @@ void CppiaModule::registerDebugger()
    for(std::unordered_set<int>::const_iterator i = allFileIds.begin(); i!=allFileIds.end(); ++i)
       addScriptableFile(strings[*i]);
 
-   #if (HXCPP_API_LEVEL >= 500)
-   if (hx::g_onScriptLoadedFunction != null{}) {
+   // Lets a debugger set breakpoints in the files this script brought
+   if (hx::g_onScriptLoadedFunction.mPtr)
       hx::g_onScriptLoadedFunction();
-   }
-   #endif
 
    #endif
 }
@@ -333,6 +345,20 @@ int CppiaModule::findInterfaceSlot(const std::string &inName)
 
 
 
+
+// Each thing is named once, at the first place the script uses it
+void CppiaModule::linkMiss(CppiaExpr *inWhere, const std::string &inWhat)
+{
+   for(size_t i=0;i<linkMisses.size();i++)
+      if (linkMisses[i].compare(0, inWhat.size(), inWhat)==0 &&
+          (linkMisses[i].size()==inWhat.size() || linkMisses[i][inWhat.size()]==' '))
+         return;
+
+   std::string miss = inWhat;
+   if (inWhere && inWhere->filename && inWhere->line>0 && strcmp(inWhere->filename,"?"))
+      miss += " (" + std::string(inWhere->filename) + ":" + std::to_string(inWhere->line) + ")";
+   linkMisses.push_back(miss);
+}
 
 void CppiaModule::where(CppiaExpr *e)
 {
@@ -817,7 +843,15 @@ CppiaLoadedModule LoadCppia(const unsigned char *inData, int inDataLength)
          throw;
       }
 
-   if (gEnableJit)
+   #ifdef CPPIA_JIT
+   bool jit = gEnableJit && CppiaCompiler::canRun();
+   if (gEnableJit && !jit)
+      CppiaCompiler::reportCannotRun();
+   #else
+   bool jit = false;
+   #endif
+
+   if (jit)
    {
       #ifdef CPPIA_JIT
       if (!error.raw_ptr())
@@ -964,6 +998,15 @@ void __hxcpp_dbg_getScriptableClasses( Array< ::String> ioClasses )
 int __scriptable_cppia_live_modules()
 {
    return hx::sLiveModules;
+}
+
+bool __scriptable_cppia_jit_active()
+{
+   #ifdef CPPIA_JIT
+   return hx::gEnableJit && hx::CppiaCompiler::canRun();
+   #else
+   return false;
+   #endif
 }
 
 ::hx::CppiaLoadedModule __scriptable_cppia_from_string(String inCode)

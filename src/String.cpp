@@ -9,6 +9,7 @@
 #include "hx/Hash.h"
 #include <hx/Thread.h>
 #include <locale>
+#include <atomic>
 
 using namespace hx;
 
@@ -2820,17 +2821,19 @@ String String::substr(int inFirst, Dynamic inLen) const
    int len = inLen == null() ? length : inLen->__ToInt();
    if (inFirst<0) inFirst += length;
    if (inFirst<0) inFirst = 0;
+   if (inFirst>=length)
+      return String::emptyString;
    if (len<0)
    {
       len = length + len - inFirst;
    }
 
-   if (len<=0 || inFirst>=length)
+   if (len<=0)
       return String::emptyString;
 
-   if ((len+inFirst > length) ) len = length - inFirst;
-   if (len==0)
-      return String::emptyString;
+   // Clamped against what is left, not by adding the two: a large len plus
+   //  inFirst overflows an int and skipped the clamp
+   if (len > length - inFirst) len = length - inFirst;
    if (inFirst==0 && len==length)
       return *this;
 
@@ -3203,6 +3206,54 @@ public:
    String mValue;
 };
 
+#ifdef HX_SMART_STRINGS
+// A boxed UTF-16 string keeps its UTF-8 form once asked for it, so native
+// code calling val_string on the same value again does not convert and
+// allocate the whole string each time.  Only boxes made from a UTF-16 string,
+// as containers, have the extra field
+class Utf16StringData : public StringData
+{
+public:
+   Utf16StringData(String inValue) : StringData(inValue), mUtf8(0) { }
+
+   const char *__CStr() const HXCPP_OVERRIDE
+   {
+      const char *utf8 = mUtf8.load(std::memory_order_acquire);
+      if (utf8)
+         return utf8;
+      utf8 = mValue.utf8_str();
+      // Keep the first one made, so a pointer handed out stays alive with the box
+      const char *expected = 0;
+      if (!mUtf8.compare_exchange_strong(expected, utf8, std::memory_order_acq_rel))
+         return expected;
+      HX_OBJ_WB_GET(const_cast<Utf16StringData *>(this), (void *)utf8);
+      return utf8;
+   }
+
+   void __Mark(hx::MarkContext *__inCtx) HXCPP_OVERRIDE
+   {
+      StringData::__Mark(__inCtx);
+      const char *utf8 = mUtf8.load(std::memory_order_relaxed);
+      HX_MARK_ARRAY(utf8);
+   }
+
+   #ifdef HXCPP_VISIT_ALLOCS
+   void __Visit(hx::VisitContext *__inCtx) HXCPP_OVERRIDE
+   {
+      StringData::__Visit(__inCtx);
+      const char *utf8 = mUtf8.load(std::memory_order_relaxed);
+      if (utf8)
+      {
+         HX_VISIT_ARRAY(utf8);
+         mUtf8.store(utf8, std::memory_order_relaxed);
+      }
+   }
+   #endif
+
+   mutable std::atomic<const char *> mUtf8;
+};
+#endif
+
 
 
 
@@ -3236,6 +3287,10 @@ hx::Object *String::__ToObject() const
       }
    }
 
+   #ifdef HX_SMART_STRINGS
+   if (isUTF16Encoded())
+      return new (NewObjContainer) Utf16StringData(*this);
+   #endif
    bool isConst = __s[HX_GC_CONST_ALLOC_MARK_OFFSET] & HX_GC_CONST_ALLOC_MARK_BIT;
    NewObjectType type = isConst ?  NewObjAlloc : NewObjContainer;
    return new (type) StringData(*this);

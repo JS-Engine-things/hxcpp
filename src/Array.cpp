@@ -118,6 +118,9 @@ Array<Dynamic> ArrayBase::__new(int inSize,int inReserve)
 
 ArrayBase::ArrayBase(int inSize,int inReserve,int inElementSize,bool inAtomic)
 {
+   #ifdef HXCPP_GC_GENERATIONAL
+   mYoungLogged = 0;
+   #endif
    int alloc = inSize < inReserve ? inReserve : inSize;
    if ((unsigned int)alloc > 0x7fffffffU/inElementSize)
    {
@@ -609,7 +612,9 @@ String ArrayBase::joinArray(Array_obj<String> *inArray, String inSeparator)
 }
 
 
-int _hx_toString_depth = 0;
+// Per thread, as an anonymous object's is: a thread formatting a nested array
+//  must not use up the depth of another formatting its own
+static thread_local int _hx_toString_depth = 0;
 String ArrayBase::joinArray(ArrayBase *inBase, String inSeparator)
 {
    if (_hx_toString_depth >= 5)
@@ -1387,6 +1392,79 @@ void VirtualArray_obj::EnsureBase()
    }
 }
 
+// Each element of typed storage compared with inValue as Dynamic values are,
+//  without boxing it, from inFrom forwards or back
+template<typename ELEM>
+static int scanStorage(hx::ArrayBase *inBase, const Dynamic &inValue, int inFrom, bool inBack)
+{
+   ELEM *e = (ELEM *)inBase->GetBase();
+   if (inBack)
+   {
+      for(int i=inFrom;i>=0;i--)
+         if (hx::IsEq(e[i],inValue))
+            return i;
+   }
+   else
+   {
+      for(int i=inFrom;i<inBase->length;i++)
+         if (hx::IsEq(e[i],inValue))
+            return i;
+   }
+   return -1;
+}
+
+// A search for a value of a type the storage does not hold. It used to
+// convert the storage to take the value, as an insert does, which boxed every
+// element or rewrote them as Float, though the search changes nothing. Each
+// element is now compared with the value as Dynamic values are, which finds
+// what the converted storage did. searchTyped when the value has the
+// storage's type, and the storage's own search applies.
+int VirtualArray_obj::searchOther(const Dynamic &inValue, const Dynamic &inFrom, bool inBack)
+{
+   int type = inValue.mPtr ? inValue->__GetType() : vtNull;
+   switch(store)
+   {
+      case arrayInt: if (type==vtInt) return searchTyped; break;
+      case arrayFloat: if (type==vtFloat || type==vtInt) return searchTyped; break;
+      case arrayInt64: if (type==vtInt64 || type==vtInt) return searchTyped; break;
+      case arrayString: if (type==vtString) return searchTyped; break;
+      case arrayBool: if (type==vtBool) return searchTyped; break;
+      default: return searchTyped;
+   }
+
+   // The start, as the typed indexOf and lastIndexOf take it
+   int len = base->length;
+   int i;
+   if (inBack)
+   {
+      i = inFrom==null() ? len-1 : inFrom->__ToInt();
+      if (i >= len)
+         i = len - 1;
+      else if (i < 0)
+         i += len;
+   }
+   else
+   {
+      i = inFrom==null() ? 0 : inFrom->__ToInt();
+      if (i < 0)
+      {
+         i += len;
+         if (i < 0) i = 0;
+      }
+   }
+
+   switch(store)
+   {
+      case arrayInt: return scanStorage<int>(base, inValue, i, inBack);
+      case arrayFloat:
+         return base->GetElementSize()==sizeof(float) ? scanStorage<float>(base, inValue, i, inBack) :
+                                                        scanStorage<double>(base, inValue, i, inBack);
+      case arrayInt64: return scanStorage< ::cpp::Int64>(base, inValue, i, inBack);
+      case arrayString: return scanStorage<String>(base, inValue, i, inBack);
+      default: return scanStorage<bool>(base, inValue, i, inBack);
+   }
+}
+
 VirtualArray VirtualArray_obj::splice(int inPos, int len)
 {
    if ( !base )
@@ -1396,6 +1474,61 @@ VirtualArray VirtualArray_obj::splice(int inPos, int len)
 
    VirtualArray result = new VirtualArray_obj( dynamic_cast<cpp::ArrayBase_obj *>(cut.mPtr), false);
    result->store = store;
+   if (store==arrayFixed)
+      result->unfix();
+   return result;
+}
+
+// A copy, slice or splice of a typed array seen as dynamic is an independent
+// dynamic array, which must take any value later, so it is not fixed to its
+// source's type. It keeps the elements' storage where a dynamic array has that
+// storage, and is converted to object storage where it does not, as for
+// Float32, Bool or the small integer types.
+void VirtualArray_obj::unfix()
+{
+   ArrayStore own = arrayNull;
+   if (dynamic_cast< Array_obj<bool> * >(base))
+      own = arrayBool;
+   else switch(base->getStoreType())
+   {
+      case arrayInt:
+      case arrayInt64:
+      case arrayString:
+         own = base->getStoreType();
+         break;
+      case arrayFloat:
+         if (base->GetElementSize()==sizeof(Float))
+            own = arrayFloat;
+         break;
+      case arrayObject:
+         if (dynamic_cast< Array_obj<Dynamic> * >(base))
+            own = arrayObject;
+         break;
+      default:
+         break;
+   }
+   if (own!=arrayNull)
+      store = own;
+   else
+      MakeObjectArray();
+}
+
+// concat with a tail that is not empty. The result takes this array's storage
+// widened for the tail's elements, worked out on a second wrapper of this
+// array's elements: converting one makes a new array, so this array keeps its
+// storage. A typed tail does not fix the result to its type either, and the
+// result is a new array, so neither changes the other later.
+VirtualArray VirtualArray_obj::concatTail(VirtualArray inTail)
+{
+   VirtualArray result = new VirtualArray_obj(base, false);
+   result->store = store;
+   if (store==arrayFixed)
+      result->unfix();
+   result->EnsureArrayStorage(inTail->store==arrayFixed ? inTail->base->getStoreType() : inTail->store);
+   if (!result->base)
+      result->MakeObjectArray();
+   result->base = result->base->__concat(inTail);
+   HX_OBJ_WB_GET(result.mPtr, result->base);
    return result;
 }
 

@@ -37,9 +37,13 @@ struct result : public hx::Object
 
    sqlite3 *db;
    sqlite3_stmt *r;
+   // The connection: while a result is reachable, its connection must not be
+   //  finalized, which would close the database under the live statement
+   hx::Object *connection;
    int ncols;
    int count;
-   String *names;
+   // The column names, collected with the result and the rows that use them
+   Array<String> names;
    int *bools;
    // The column for each of a row's fixed fields, which Anon_obj keeps
    // sorted by name hash
@@ -47,22 +51,25 @@ struct result : public hx::Object
    int done;
    int first;
 
-   void create(sqlite3 *inDb, sqlite3_stmt *inR, String sql)
+   void create(hx::Object *inConnection, sqlite3 *inDb, sqlite3_stmt *inR, String sql)
    {
       _hx_set_finalizer(this, finalize);
 
+      connection = inConnection;
+      HX_OBJ_WB_GET(this, connection);
       db = inDb;
       r = inR;
 
       ncols = sqlite3_column_count(r);
-      names = (String *)malloc(sizeof(String)*ncols);
+      names = Array_obj<String>::__new(ncols, ncols);
+      HX_OBJ_WB_GET(this, names.mPtr);
       bools = (int*)malloc(sizeof(int)*ncols);
       order = (int*)malloc(sizeof(int)*(ncols > 0 ? ncols : 1));
       first = 1;
       done = 0;
       for(int i=0;i<ncols;i++)
       {
-         names[i] = String::createPermanent(sqlite3_column_name(r,i),-1);
+         names[i] = String::create(sqlite3_column_name(r,i));
          for(int j=0;j<i;j++)
             if( names[j] == names[i] )
                hx::Throw(HX_CSTRING("Error, same field is two times in the request ") + sql);
@@ -71,9 +78,22 @@ struct result : public hx::Object
          bools[i] = dtype?(strcmp(dtype,"BOOL") == 0):0;
          order[i] = i;
       }
-      String *n = names;
-      std::sort(order, order+ncols, [n](int a, int b) { return (int)n[a].hash() < (int)n[b].hash(); });
+      Array<String> n = names;
+      std::sort(order, order+ncols, [&n](int a, int b) { return (int)n[a].hash() < (int)n[b].hash(); });
    }
+
+   void __Mark(hx::MarkContext *__inCtx) HXCPP_OVERRIDE
+   {
+      HX_MARK_MEMBER(names);
+      HX_MARK_OBJECT(connection);
+   }
+   #ifdef HXCPP_VISIT_ALLOCS
+   void __Visit(hx::VisitContext *__inCtx) HXCPP_OVERRIDE
+   {
+      HX_VISIT_MEMBER(names);
+      HX_VISIT_OBJECT(connection);
+   }
+   #endif
 
    static void finalize(Dynamic obj) { ((result *)(obj.mPtr))->destroy(false); }
    void destroy(bool inThrowError)
@@ -82,11 +102,6 @@ struct result : public hx::Object
       {
          free(bools);
          bools = 0;
-      }
-      if (names)
-      {
-         free(names);
-         names = 0;
       }
       if (order)
       {
@@ -179,6 +194,16 @@ struct database : public hx::Object
    String toString() HXCPP_OVERRIDE { return HX_CSTRING("Sqlite Databse"); }
 };
 
+// A column as text, all its bytes: TEXT values can hold NUL characters. The
+//  byte count is read after the text, as SQLite asks
+static String columnText(sqlite3_stmt *inStatement, int inColumn)
+{
+   const char *text = (const char *)sqlite3_column_text(inStatement,inColumn);
+   if (!text)
+      return String();
+   return String::create(text, sqlite3_column_bytes(inStatement,inColumn));
+}
+
 static void sqlite_error( sqlite3 *db ) {
    hx::Throw( HX_CSTRING("Sqlite error : ") + String(sqlite3_errmsg(db)) );
 }
@@ -218,7 +243,12 @@ Dynamic _hx_sqlite_connect(String filename)
    int err = sqlite3_open(filenameUtf8,&sqlDb);
    __hxcpp_exit_gc_free_zone();
    if (err != SQLITE_OK)
-      sqlite_error(sqlDb);
+   {
+      // SQLite still allocates a handle when the open fails; only close frees it
+      String message = sqlDb ? String(sqlite3_errmsg(sqlDb)) : HX_CSTRING("out of memory");
+      sqlite3_close(sqlDb);
+      hx::Throw( HX_CSTRING("Sqlite error : ") + message );
+   }
 
    database *db = new database();
    db->create(sqlDb);
@@ -295,7 +325,7 @@ Dynamic _hx_sqlite_request(Dynamic handle,String sql)
    int i,j;
 
    result *r = new result();
-   r->create(db->db, statement,sql);
+   r->create(db, db->db, statement,sql);
 
    db->setResult(r);
 
@@ -379,7 +409,7 @@ Dynamic _hx_sqlite_result_next(Dynamic handle)
                f = Float(sqlite3_column_double(r->r,i));
                break;
             case SQLITE_TEXT:
-               f = String((char*)sqlite3_column_text(r->r,i));
+               f = columnText(r->r,i);
                break;
             case SQLITE_BLOB:
                {
@@ -445,7 +475,7 @@ static sqlite3_stmt *prepStatement(Dynamic handle,int n)
 String  _hx_sqlite_result_get(Dynamic handle,int n)
 {
    sqlite3_stmt *r = prepStatement(handle,n);
-   return String((char*)sqlite3_column_text(r,n));
+   return columnText(r,n);
 }
 
 /**

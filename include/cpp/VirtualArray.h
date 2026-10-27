@@ -433,13 +433,17 @@ public:
 
    inline Dynamic pop() { checkBase(); return store==hx::arrayEmpty ? null() : base->__pop(); }
 
+   // A search never converts the storage, see searchOther
+   enum { searchTyped = -2 };
+   int searchOther(const Dynamic &inValue, const Dynamic &inFrom, bool inBack);
+
    inline bool contains(Dynamic inValue)
    {
       checkBase();
       if (store==hx::arrayEmpty)
          return false;
-      EnsureStorage(inValue);
-      return base->__contains(inValue);
+      int found = searchOther(inValue, null(), false);
+      return found==searchTyped ? base->__contains(inValue) : found>=0;
    }
 
    inline bool remove(Dynamic inValue)
@@ -447,8 +451,8 @@ public:
       checkBase();
       if (store==hx::arrayEmpty)
          return false;
-      EnsureStorage(inValue);
-      return base->__remove(inValue);
+      int found = searchOther(inValue, null(), false);
+      return found==searchTyped ? base->__remove(inValue) : found>=0 && base->__removeAt(found);
    }
 
    inline bool removeAt(int inIndex) { checkBase(); return (store!=hx::arrayEmpty) && base->__removeAt(inIndex); }
@@ -458,16 +462,16 @@ public:
       checkBase();
       if (store==hx::arrayEmpty)
          return -1;
-      EnsureStorage(inValue);
-      return (int)base->__indexOf(inValue,fromIndex);
+      int found = searchOther(inValue, fromIndex, false);
+      return found==searchTyped ? (int)base->__indexOf(inValue,fromIndex) : found;
    }
    int lastIndexOf(Dynamic inValue, Dynamic fromIndex = null())
    {
       checkBase();
       if (store==hx::arrayEmpty)
          return -1;
-      EnsureStorage(inValue);
-      return (int)base->__lastIndexOf(inValue,fromIndex);
+      int found = searchOther(inValue, fromIndex, true);
+      return found==searchTyped ? (int)base->__lastIndexOf(inValue,fromIndex) : found;
    }
 
    Dynamic shift() { checkBase(); return store==hx::arrayEmpty ? null() : base->__shift(); }
@@ -480,16 +484,10 @@ public:
       // later int pushes truncate to 8 bits
       if (inTail->__length()<1)
          return copy();
-      EnsureArrayStorage(inTail);
-      if (!base)
-         MakeObjectArray();
-      VirtualArray result = new VirtualArray_obj( base->__concat(inTail), store==hx::arrayFixed );
-      if (store!=hx::arrayFixed)
-         // The constructor infers the store from the element type, which
-         // reports bool storage as object - keep the known store
-         result->store = store;
-      return result;
+      return concatTail(inTail);
    }
+   VirtualArray concatTail(VirtualArray inTail);
+   void unfix();
    VirtualArray copy( )
    {
       checkBase();
@@ -497,7 +495,9 @@ public:
          return new VirtualArray_obj(hx::arrayEmpty);
 
       VirtualArray result = new VirtualArray_obj(base->__copy(), store==hx::arrayFixed);
-      if (store!=hx::arrayFixed)
+      if (store==hx::arrayFixed)
+         result->unfix();
+      else
          result->store = store;
       return result;
    }
@@ -507,7 +507,9 @@ public:
       if (store==hx::arrayEmpty)
          return new VirtualArray_obj(hx::arrayEmpty);
       VirtualArray result = new VirtualArray_obj(base->__slice(inPos,end), store==hx::arrayFixed);
-      if (store!=hx::arrayFixed)
+      if (store==hx::arrayFixed)
+         result->unfix();
+      else
          result->store = store;
       return result;
    }

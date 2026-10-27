@@ -219,6 +219,13 @@ Dynamic _hx_std_file_open( String fname, String r )
       file_error("file_open",fname);
    const char *mode = r.utf8_str(&buf1);
    bool readAhead = mode[0]=='r' && !strchr(mode,'+') && isRegularFile(file);
+   #ifdef NEKO_WINDOWS
+   // Not in text mode, where the CRT turns CRLF into LF as it reads: the
+   // bytes read ahead are fewer than the stream moved over, so tell and
+   // relative seeks, which take them back, landed past unread text
+   if (!strchr(mode,'b'))
+      readAhead = false;
+   #endif
    hx::ExitGCFreeZone();
 
    fio *f = new fio;
@@ -372,7 +379,11 @@ int _hx_std_file_read( Dynamic handle, Array<unsigned char> buf, int p, int n )
 
    int buf_len = buf->length;
    int len = n;
-   if( p < 0 || len < 0 || p > buf_len || p + len > buf_len )
+   if( p < 0 || len < 0 || p > buf_len || len > buf_len - p )
+      return 0;
+   // Reading nothing changes nothing: &buf[0] would grow an empty buffer, and
+   //  clearing aheadAtEnd below would report the end of a read-ahead file early
+   if( len == 0 )
       return 0;
 
    AheadLock lock(f);
@@ -484,14 +495,24 @@ void _hx_std_file_seek( Dynamic handle, int pos, int kind )
 {
    fio *f = getFio(handle);
    AheadLock lock(f);
+   // The stream is past the bytes read ahead, so a relative seek takes them
+   // back too: in 64 bits, as an int wrapped a large backward seek into a
+   // forward one
+   long long offset = pos;
    if (kind == SEEK_CUR)
-      pos -= lock.unread();
-   f->aheadPos = f->aheadLen = 0;
-   f->aheadAtEnd = false;
+      offset -= lock.unread();
    hx::EnterGCFreeZone();
-   if( fseek(f->io,pos,kind) != 0 )
+   #ifdef NEKO_WINDOWS
+   int failed = _fseeki64(f->io,offset,kind);
+   #else
+   int failed = (off_t)offset != offset || fseeko(f->io,(off_t)offset,kind);
+   #endif
+   // A failed seek leaves the stream, and so the bytes read ahead, as they were
+   if( failed )
       file_error("file_seek",f->name);
    hx::ExitGCFreeZone();
+   f->aheadPos = f->aheadLen = 0;
+   f->aheadAtEnd = false;
 }
 
 /**

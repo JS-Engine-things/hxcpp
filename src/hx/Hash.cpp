@@ -7,6 +7,12 @@ using namespace hx;
 
 // --- HashRoot ---------------------------------------------------
 
+int &hx::HashToStringDepth()
+{
+   static thread_local int depth = 0;
+   return depth;
+}
+
 int __root_hash_size(Dynamic &rtHash)
 {
    HashRoot *hash = static_cast<HashRoot *>(rtHash.GetPtr());
@@ -1064,13 +1070,13 @@ void __object_hash_set_float(HX_MAP_THIS_ARG,Dynamic inKey,Float inValue,bool in
       ioHash = hash;
       HX_OBJ_WB_GET(owner,hash);
    }
-   else if (hash->store==hashString)
+   else if (hash->store==hashString || hash->store==hashInt64)
    {
       hash = hash->convertStore(hashObject);
       ioHash = hash;
       HX_OBJ_WB_GET(owner,hash);
    }
-   else if (hash->store==hashInt || hash->store==hashInt64)
+   else if (hash->store==hashInt)
    {
       hash = hash->convertStore(hashFloat);
       ioHash = hash;

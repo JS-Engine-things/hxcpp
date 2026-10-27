@@ -231,11 +231,21 @@ static unsigned char *scriptableBase(unsigned char *inStack, int stackSize,
    return inStack - stackSize - sizeof(hx::Object *) - argBytes;
 }
 
+// Without the JIT, as on Emscripten, every frame is interpreted
+static bool isJitted(const ScriptCallable *inFunc)
+{
+   #ifdef CPPIA_JIT
+   return inFunc->compiled!=0;
+   #else
+   return false;
+   #endif
+}
+
 void ScriptCallable::getScriptableVariables(unsigned char *inStack, Array<Dynamic> outNames)
 {
-   unsigned char *base = scriptableBase(inStack, stackSize, args, compiled!=0);
+   unsigned char *base = scriptableBase(inStack, stackSize, args, isJitted(this));
 
-   hx::Object *thizz = *(hx::Object **)base;
+   hx::Object *thizz = CppiaCtx::getSlot<hx::Object *>(base);
    if (thizz && !staticEntry)
       outNames->push(HX_CSTRING("this"));
 
@@ -249,10 +259,10 @@ void ScriptCallable::getScriptableVariables(unsigned char *inStack, Array<Dynami
 
 bool ScriptCallable::getScriptableValue(unsigned char *inStack, String inName, ::Dynamic &outValue)
 {
-   unsigned char *base = scriptableBase(inStack, stackSize, args, compiled!=0);
+   unsigned char *base = scriptableBase(inStack, stackSize, args, isJitted(this));
    if (inName == HX_CSTRING("this") && !staticEntry)
    {
-      outValue = *(hx::Object **)base;
+      outValue = CppiaCtx::getSlot<hx::Object *>(base);
       return true;
    }
 
@@ -273,7 +283,7 @@ bool ScriptCallable::getScriptableValue(unsigned char *inStack, String inName, :
 
 bool ScriptCallable::setScriptableValue(unsigned char *inStack, String inName, ::Dynamic inValue)
 {
-   unsigned char *base = scriptableBase(inStack, stackSize, args, compiled!=0);
+   unsigned char *base = scriptableBase(inStack, stackSize, args, isJitted(this));
    for(CppiaStackVarMap::iterator i=varMap.begin();i!=varMap.end();++i)
    {
       CppiaStackVar *var = i->second;
@@ -604,7 +614,7 @@ void ScriptCallable::runFunction(CppiaCtx *ctx)
                args[i].setDefault(ctx, initVals[i]);
       }
       if (staticEntry && data)
-         *(hx::Object **)ctx->frame = data->owner;
+         CppiaCtx::setSlot(ctx->frame, data->owner);
 
       CPPIA_STACK_FRAME(this);
       CPPIA_STACK_LINE(this);
@@ -643,7 +653,7 @@ void ScriptCallable::runFunctionClosure(CppiaCtx *ctx)
                args[i].setDefault(ctx, initVals[i]);
       }
       if (staticEntry && data)
-         *(hx::Object **)ctx->frame = data->owner;
+         CppiaCtx::setSlot(ctx->frame, data->owner);
 
       CPPIA_STACK_FRAME(this);
       CPPIA_STACK_LINE(this);
@@ -847,7 +857,7 @@ public:
 
       unsigned char *base = ((unsigned char *)this) + sizeof(CppiaClosure);
       // this pointer...
-      *(hx::Object **)ctx->frame =  *(hx::Object **)base;
+      CppiaCtx::setSlot(ctx->frame, *(hx::Object **)base);
 
       for(int i=0;i<function->captureVars.size();i++)
       {

@@ -103,9 +103,10 @@ public:
    }
    inline unsigned int getHash() { return hash; }
 
-   Value                value;
+   // hash beside a 4-byte value fills what would be padding (see TStringElement)
    Key                  key;
    unsigned int         hash;
+   Value                value;
    TInt64Element<VALUE> *next;
 };
 
@@ -135,9 +136,11 @@ public:
    }
    inline unsigned int getHash() { return hash; }
 
-   Value                  value;
+   // With value first, an Int value and the hash each left 4 bytes of
+   //  padding: 40 bytes on 64-bit where 32 hold the same fields
    Key                    key;
    unsigned int           hash;
+   Value                  value;
    TStringElement<VALUE>  *next;
 };
 
@@ -231,9 +234,10 @@ public:
    }
    inline unsigned int getHash() { return hash; }
 
-   Value                        value;
+   // hash beside a 4-byte value fills what would be padding (see TStringElement)
    Key                          key;
    unsigned int                 hash;
+   Value                        value;
    TDynamicElement<VALUE,WEAK>  *next;
 };
 
@@ -287,6 +291,10 @@ struct HashRoot : public Object
    int       size;
    int       mask;
    int       bucketCount;
+   #ifdef HXCPP_GC_GENERATIONAL
+   // The young values logged for this map in the cycle (hx::YoungStore)
+   unsigned int mYoungLogged;
+   #endif
 
     HX_IS_INSTANCE_OF enum { _hx_ClassId = hx::clsIdHash };
 
@@ -294,6 +302,30 @@ struct HashRoot : public Object
    virtual bool markWeakValues(MarkContext *__inCtx) = 0;
 
    inline int getSize() { return size; }
+};
+
+// How many maps this thread is formatting, one inside another.  A map that
+//  held itself, directly or through other maps, recursed until the native
+//  stack overflowed; past 5, as for arrays and anonymous objects, a map
+//  formats as "...".  Per thread, and given back when a key or value's
+//  toString throws
+int &HashToStringDepth();
+
+struct ToStringDepth
+{
+   bool tooDeep;
+   ToStringDepth()
+   {
+      int &depth = HashToStringDepth();
+      tooDeep = depth >= 5;
+      if (!tooDeep)
+         depth++;
+   }
+   ~ToStringDepth()
+   {
+      if (!tooDeep)
+         HashToStringDepth()--;
+   }
 };
 
 template<typename KEY>
@@ -305,6 +337,9 @@ struct HashBase : public HashRoot
       size = 0;
       mask = 0;
       bucketCount = 0;
+      #ifdef HXCPP_GC_GENERATIONAL
+      mYoungLogged = 0;
+      #endif
    }
 
 
@@ -360,6 +395,9 @@ struct Hash : public HashBase< typename ELEMENT::Key >
 
 
    ELEMENT **bucket;
+   // A collection folded the buckets down in place, so the array is bigger
+   //  than bucketCount needs until the next insert or remove reallocates it
+   bool bucketsOversized;
 
    // Int keys start on the identity hash: it matches stock hxcpp and spreads
    // arithmetic keys (ids, i*odd, offsets) with no collisions at all. Keys
@@ -376,6 +414,7 @@ struct Hash : public HashBase< typename ELEMENT::Key >
    Hash() : HashBase<Key>( StoreOf<Value>::store )
    {
       bucket = 0;
+      bucketsOversized = false;
       mixIntKeys = false;
       if (ELEMENT::WeakKeys && Element::ManageKeys)
          RegisterWeakHash(this);
@@ -466,7 +505,54 @@ struct Hash : public HashBase< typename ELEMENT::Key >
             bucket = 0;
             bucketCount = 0;
             mask = 0;
+            bucketsOversized = false;
          }
+         // Most keys gone: fold the buckets down, in place, to the count that
+         // remove() would compact to, so the collections that follow scan the
+         // buckets in use rather than the most there ever were. The array keeps
+         // its size until the next insert or remove, which may allocate
+         // (libhxcpp #204)
+         else if (bucketCount>8 && size < (bucketCount>>2))
+         {
+            int newCount = bucketCount;
+            while(newCount>8 && size < (newCount>>2))
+               newCount >>= 1;
+            foldBuckets(newCount);
+            bucketsOversized = true;
+         }
+      }
+   }
+
+   // Moves the elements of buckets [inNewCount,bucketCount) into the first
+   // inNewCount, which becomes the count. Allocates nothing
+   void foldBuckets(int inNewCount)
+   {
+      int newMask = inNewCount-1;
+      for(int b=inNewCount; b<bucketCount; b++)
+      {
+         Element *head = bucket[b];
+         if (head)
+         {
+            Element **lastPtr = &(head->next);
+            while(*lastPtr)
+               lastPtr = & (*lastPtr)->next;
+            *lastPtr = bucket[b & newMask];
+            bucket[b & newMask] = head;
+            bucket[b] = 0;
+         }
+      }
+      mask = newMask;
+      bucketCount = inNewCount;
+   }
+
+   // An array a collection folded down gets the size its count needs
+   void releaseOversizedBuckets()
+   {
+      if (bucketsOversized)
+      {
+         bucketsOversized = false;
+         bucket = (Element **)InternalRealloc(bucketCount*sizeof(ELEMENT *),bucket, sizeof(ELEMENT *)*bucketCount );
+         HX_OBJ_WB_GET(this, bucket);
       }
    }
 
@@ -547,31 +633,10 @@ struct Hash : public HashBase< typename ELEMENT::Key >
 
    void compact()
    {
-      int origSize = bucketCount;
-      int newSize = bucketCount>>1;
-      // printf("compact -> %d\n", newSize);
-      mask = newSize-1;
-      for(int b=newSize; b<bucketCount; b++)
-      {
-         Element *head = bucket[b];
-         if (head)
-         {
-            Element *oldHead = bucket[b-newSize];
-            bucket[b-newSize] = head;
-
-            if (oldHead)
-            {
-               // Append to last element
-               Element **lastPtr = &(head->next);
-               while(*lastPtr)
-                  lastPtr = & (*lastPtr)->next;
-               *lastPtr = oldHead;
-            }
-            bucket[b] = 0;
-         }
-      }
-      bucketCount = newSize;
-      bucket = (Element **)InternalRealloc(origSize*sizeof(ELEMENT *),bucket, sizeof(ELEMENT *)*bucketCount );
+      // printf("compact -> %d\n", bucketCount>>1);
+      foldBuckets(bucketCount>>1);
+      bucketsOversized = false;
+      bucket = (Element **)InternalRealloc(bucketCount*sizeof(ELEMENT *),bucket, sizeof(ELEMENT *)*bucketCount );
       HX_OBJ_WB_GET(this, bucket);
    }
 
@@ -579,6 +644,7 @@ struct Hash : public HashBase< typename ELEMENT::Key >
    {
       if (!bucket)
          return false;
+      releaseOversizedBuckets();
       unsigned int hash = keyHash(inKey);
       Element **head = bucket + (hash&mask);
       while(*head)
@@ -603,6 +669,7 @@ struct Hash : public HashBase< typename ELEMENT::Key >
 
    ELEMENT *allocElement()
    {
+      releaseOversizedBuckets();
       ELEMENT *result = (ELEMENT *)InternalNew( sizeof(ELEMENT), false );
       size++;
       expandBuckets(size);
@@ -719,6 +786,30 @@ struct Hash : public HashBase< typename ELEMENT::Key >
       return inPtr && !(((unsigned char *)inPtr)[ HX_ENDIAN_MARK_ID_BYTE]);
    }
 
+   #ifdef HXCPP_GC_GENERATIONAL
+   // The barrier for young values stored in this map while it is old. A
+   //  large strong map logs them (hx::YoungStore) rather than be remembered
+   //  whole. A weak map's values live only with their keys, which marking
+   //  the map decides, so it is remembered whole
+   void rememberYoung(const void *inA, const void *inB, const void *inC)
+   {
+      unsigned char &mark =  ((unsigned char *)(this))[ HX_ENDIAN_MARK_ID_BYTE];
+      if (mark == hx::gByteMarkID && (IsNursery(inA) || IsNursery(inB) || IsNursery(inC)) )
+      {
+         if (Element::WeakKeys)
+         {
+            mark|=HX_GC_REMEMBERED;
+            (HX_CTX_GET)->pushReferrer(this);
+         }
+         else
+         {
+            const void *values[] = { inA, inB, inC };
+            hx::YoungStore(this, this->mYoungLogged, size, values, 3, HX_CTX_GET);
+         }
+      }
+   }
+   #endif
+
    template<typename SET>
    void TSet(Key inKey, const SET &inValue)
    {
@@ -739,8 +830,10 @@ struct Hash : public HashBase< typename ELEMENT::Key >
       if (el)
       {
          CopyValue(el->value,inValue);
+         #ifdef HXCPP_GC_GENERATIONAL
          if (hx::ContainsPointers<Value>())
-            HX_OBJ_WB_GET(this,hx::PointerOf(el->value));
+            rememberYoung(hx::PointerOf(el->value), 0, 0);
+         #endif
          return;
       }
       el = allocElement();
@@ -753,17 +846,9 @@ struct Hash : public HashBase< typename ELEMENT::Key >
       bucket[hash&mask] = el;
 
       #ifdef HXCPP_GC_GENERATIONAL
-      unsigned char &mark =  ((unsigned char *)(this))[ HX_ENDIAN_MARK_ID_BYTE];
-      if (mark == hx::gByteMarkID)
-      {
-         // Look for nursery objects...
-         if ( IsNursery(el) || IsNursery(hx::PointerOf(el->key)) ||
-             (hx::ContainsPointers<Value>() && IsNursery(hx::PointerOf(el->value)) ) )
-         {
-            mark|=HX_GC_REMEMBERED;
-            (HX_CTX_GET)->pushReferrer(this);
-         }
-      }
+      // The new element, and its key and value, may be nursery objects
+      rememberYoung(el, hx::PointerOf(el->key),
+                    hx::ContainsPointers<Value>() ? hx::PointerOf(el->value) : 0);
       #endif
    }
 
@@ -777,6 +862,7 @@ struct Hash : public HashBase< typename ELEMENT::Key >
    void clear() HXCPP_OVERRIDE
    {
       bucket = 0;
+      bucketsOversized = false;
       size = 0;
       mask = 0;
       bucketCount = 0;
@@ -913,6 +999,9 @@ struct Hash : public HashBase< typename ELEMENT::Key >
 
    String toString() HXCPP_OVERRIDE
    {
+      ToStringDepth depth;
+      if (depth.tooDeep)
+         return HX_CSTRING("...");
       StringBuilder builder(getSize());
       iterate(builder);
       return builder.toString();
@@ -921,6 +1010,9 @@ struct Hash : public HashBase< typename ELEMENT::Key >
 
    String toStringRaw() HXCPP_OVERRIDE
    {
+      ToStringDepth depth;
+      if (depth.tooDeep)
+         return HX_CSTRING("...");
       StringBuilder builder(getSize(),true);
       iterate(builder);
       return builder.toString();

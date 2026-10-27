@@ -15,6 +15,7 @@
 #include <atomic>
 #include <inttypes.h>
 #include <limits>
+#include <exception>
 
 #ifdef __EMSCRIPTEN__
    #include <emscripten/stack.h>
@@ -1004,6 +1005,46 @@ struct BlockDataInfo
 
    void countRows(BlockDataStats &outStats)
    {
+      #ifdef HXCPP_GC_GENERATIONAL
+      // Only a minor collection counts rows, and it marks rows in a block only
+      // for an object it marks there, which sets mHasSurvivor. Without one,
+      // the row marks are the ones mUsedRows was worked out from, so it stands,
+      // and reading them again in every block was most of an idle minor
+      // collection (libhxcpp #329). The state below is reset all the same.
+      if (mHasSurvivor)
+      #endif
+         countMarkedRows();
+
+      mZeroLock = 0;
+      mOwned = false;
+      checkRowCounts();
+      outStats.rowsInUse += mUsedRows;
+      outStats.bytesInUse += mUsedBytes;
+      outStats.fraggedRows += mFraggedRows;
+      mFraggedRows = 0;
+      mHoles = 0;
+
+      if (mUsedRows==IMMIX_USEFUL_LINES)
+      {
+         // All rows used - write the block off
+         mMoveScore = 0;
+         mZeroed = ZEROED_AUTO;
+         mReclaimed = true;
+      }
+      else
+      {
+         mZeroed = ZEROED_NOT;
+         mReclaimed = false;
+      }
+
+      uint16_t left{ static_cast<uint16_t>((IMMIX_USEFUL_LINES - mUsedRows) << IMMIX_LINE_BITS) };
+      if (left<mMaxHoleSize)
+         mMaxHoleSize = left;
+   }
+
+   // mUsedRows and mUsedBytes from the row marks
+   void countMarkedRows()
+   {
       unsigned char *rowMarked = mPtr->mRowMarked;
       unsigned int *rowTotals = ((unsigned int *)rowMarked) + 1;
 
@@ -1051,32 +1092,6 @@ struct BlockDataInfo
 
       mUsedRows = (total & 0xff) + ((total>>8) & 0xff) + ((total>>16)&0xff) + ((total>>24)&0xff);
       mUsedBytes = uint16_t{ mUsedRows } << IMMIX_LINE_BITS;
-
-      mZeroLock = 0;
-      mOwned = false;
-      checkRowCounts();
-      outStats.rowsInUse += mUsedRows;
-      outStats.bytesInUse += mUsedBytes;
-      outStats.fraggedRows += mFraggedRows;
-      mFraggedRows = 0;
-      mHoles = 0;
-
-      if (mUsedRows==IMMIX_USEFUL_LINES)
-      {
-         // All rows used - write the block off
-         mMoveScore = 0;
-         mZeroed = ZEROED_AUTO;
-         mReclaimed = true;
-      }
-      else
-      {
-         mZeroed = ZEROED_NOT;
-         mReclaimed = false;
-      }
-
-      uint16_t left{ static_cast<uint16_t>((IMMIX_USEFUL_LINES - mUsedRows) << IMMIX_LINE_BITS) };
-      if (left<mMaxHoleSize)
-         mMaxHoleSize = left;
    }
 
    template<bool FULL>
@@ -1877,6 +1892,108 @@ struct GlobalChunks
 
 GlobalChunks sGlobalChunks;
 
+#ifdef HXCPP_GC_GENERATIONAL
+// A young value stored in an old array or map made the whole of it a
+// remembered referrer, so the next minor collection marked every element,
+// however few changed: one store in an old four-million-element array added
+// 2-3 ms to it (libhxcpp #301), and one in an old million-entry map 1.3 ms
+// (#305). For a large one, the young values themselves are logged now, and the
+// minor collection marks them as roots. That keeps a value alive wherever it
+// is moved to, by a sort, splice or blit in an array or a rehash in a map,
+// which a range of dirty slots would not. A value overwritten before then
+// lives one collection longer. Past a thirty-second of the length in one
+// cycle, marking the whole is cheaper, so it is remembered whole, as before.
+static MarkChunk *sYoungValueChunks = 0;
+// Never destroyed: hx::FastMutex is a std::mutex off Windows, which a
+//  thread still storing into an array at exit could take after it went (#371)
+static hx::FastMutex &sYoungValueLock = *new hx::FastMutex();
+static unsigned int sCollectCycle = 1;
+
+enum { YOUNG_LOG_MIN_LENGTH = 1024 };
+
+void YoungStore(hx::Object *inOwner, unsigned int &ioLogged, int inLength, const void *const *inValues, int inCount, StackContext *inCtx)
+{
+   if (inCtx->mYoungValues && inLength>=YOUNG_LOG_MIN_LENGTH)
+   {
+      // Counted per cycle: the cycle is in the top 12 bits. A lost update
+      //  between threads only logs more than the limit
+      unsigned int logged = ioLogged;
+      unsigned int cycle = sCollectCycle & 0xfff;
+      unsigned int count = (logged>>20)==cycle ? (logged & 0xfffff) : 0;
+      unsigned int limit = std::min( (unsigned int)inLength>>5, 0xfffffu );
+      if (count<limit)
+      {
+         ioLogged = (cycle<<20) | (count+1);
+         for(int v=0;v<inCount;v++)
+         {
+            const void *value = inValues[v];
+            if (!value || ((unsigned char *)value)[HX_ENDIAN_MARK_ID_BYTE])
+               continue;
+            MarkChunk *chunk = inCtx->mYoungValues;
+            chunk->push( (hx::Object *)value );
+            if (chunk->count==MarkChunk::SIZE)
+            {
+               {
+                  std::lock_guard<hx::FastMutex> lock(sYoungValueLock);
+                  chunk->next = sYoungValueChunks;
+                  sYoungValueChunks = chunk;
+               }
+               inCtx->mYoungValues = sGlobalChunks.alloc();
+            }
+         }
+         return;
+      }
+   }
+   unsigned char &mark = ((unsigned char *)inOwner)[HX_ENDIAN_MARK_ID_BYTE];
+   mark |= HX_GC_REMEMBERED;
+   inCtx->pushReferrer(inOwner);
+}
+
+void ArrayYoungStore(ArrayBase *inArray, const void *inValue, StackContext *inCtx)
+{
+   YoungStore(inArray, inArray->mYoungLogged, inArray->length, &inValue, 1, inCtx);
+}
+
+// Takes a thread's log, under the lock or with the world stopped
+static void TakeYoungValues(MarkChunk *&ioChunk)
+{
+   if (ioChunk)
+   {
+      if (ioChunk->count)
+      {
+         ioChunk->next = sYoungValueChunks;
+         sYoungValueChunks = ioChunk;
+      }
+      else
+         sGlobalChunks.free(ioChunk);
+      ioChunk = 0;
+   }
+}
+
+// Marks the logged values in a minor collection, and drops the log
+static void MarkYoungValues(bool inMark, hx::MarkContext *inCtx)
+{
+   while(sYoungValueChunks)
+   {
+      MarkChunk *c = sYoungValueChunks;
+      sYoungValueChunks = c->next;
+      if (inMark)
+         for(int i=0;i<c->count;i++)
+         {
+            void *value = c->stack[i];
+            // An object with members to mark has the container bit; a string's
+            //  data or a plain buffer is marked as an allocation
+            if ( ((unsigned int *)value)[-1] & IMMIX_ALLOC_IS_CONTAINER )
+               hx::MarkObjectAlloc((hx::Object *)value, inCtx);
+            else
+               hx::MarkAlloc(value, inCtx);
+         }
+      c->count = 0;
+      sGlobalChunks.free(c);
+   }
+}
+#endif
+
 class MarkContext
 {
     #ifdef HXCPP_DEBUG
@@ -2591,8 +2708,16 @@ void GcRemoveOffsetRoot(void *inRoot)
 class WeakRef;
 typedef hx::QuickVec<WeakRef *> WeakRefs;
 
+// The finalizer tables and the weak references are each in two parts. An
+// entry is new until a collection finds its object alive, and then old: an
+// old object dies only in a full collection, so a minor collection looks at
+// the new entries alone, and moves those that survive to the old part. It used
+// to walk every entry, which made a minor collection with many long-lived
+// finalized objects or weak references take as long as their number
+// (libhxcpp #302, #314).
 FILE_SCOPE std::mutex *sFinalizerLock = 0;
 FILE_SCOPE WeakRefs &sWeakRefs = *new WeakRefs();
+FILE_SCOPE WeakRefs &sOldWeakRefs = *new WeakRefs();
 
 class WeakRef : public hx::Object
 {
@@ -2623,13 +2748,16 @@ public:
 typedef hx::QuickVec<InternalFinalizer *> FinalizerList;
 
 FILE_SCOPE FinalizerList *sgFinalizers = 0;
+FILE_SCOPE FinalizerList *sgOldFinalizers = 0;
 
 typedef std::unordered_map<hx::Object *,hx::finalizer> FinalizerMap;
 FILE_SCOPE FinalizerMap &sFinalizerMap = *new FinalizerMap();
+FILE_SCOPE FinalizerMap &sOldFinalizerMap = *new FinalizerMap();
 
 typedef void (*HaxeFinalizer)(Dynamic);
 typedef std::unordered_map<hx::Object *,HaxeFinalizer> HaxeFinalizerMap;
 FILE_SCOPE HaxeFinalizerMap &sHaxeFinalizerMap = *new HaxeFinalizerMap();
+FILE_SCOPE HaxeFinalizerMap &sOldHaxeFinalizerMap = *new HaxeFinalizerMap();
 
 hx::QuickVec<int> &sFreeObjectIds = *new hx::QuickVec<int>();
 typedef std::unordered_map<hx::Object *,int> ObjectIdMap;
@@ -2713,30 +2841,37 @@ bool IsWeakRefValid(hx::Object *inPtr)
     // Special case of member closure - check if the 'this' pointer is still alive.
     // Adapters return the callable they wrap, so follow the chain to the receiver.
     bool isCurrent = mark==gByteMarkID;
+    // A chain of any length is followed: a limit of 16 hops cleared the
+    //  callbacks behind 16 adapters while their receiver lived (libhxcpp #364).
+    //  A second pointer follows at half speed, so a cycle of dead adapters
+    //  catches up with it and ends the walk.
     if ( !isCurrent && inPtr->__GetType()==vtFunction)
     {
-        enum { MAX_HOPS = 16 };
-        hx::Object *chain[MAX_HOPS];
-        int hops = 0;
         hx::Object *fn = inPtr;
-        while(hops<MAX_HOPS)
+        hx::Object *slow = inPtr;
+        bool moveSlow = false;
+        while(true)
         {
-            chain[hops++] = fn;
             hx::Object *thiz = (hx::Object *)fn->__GetHandle();
             if (!thiz)
                break;
             mark = ((unsigned char *)thiz)[HX_ENDIAN_MARK_ID_BYTE];
             if ( (((unsigned int *)thiz)[-1] & HX_GC_CONST_ALLOC_BIT) || mark==gByteMarkID)
             {
-               // The object is still alive, so mark the closures and continue
-               for(int i=0;i<hops;i++)
-                  MarkAlloc(chain[i],0);
+               // The object is still alive, so mark the closures that lead to it
+               for(hx::Object *link=inPtr; link!=thiz; link=(hx::Object *)link->__GetHandle())
+                  MarkAlloc(link,0);
                return true;
             }
             // A String's member closures hand back its characters, not an object
             if (!(((unsigned int *)thiz)[-1] & IMMIX_ALLOC_IS_CONTAINER) || thiz->__GetType()!=vtFunction)
                break;
             fn = thiz;
+            if (moveSlow)
+               slow = (hx::Object *)slow->__GetHandle();
+            moveSlow = !moveSlow;
+            if (fn==slow)
+               break;
         }
     }
     return isCurrent;
@@ -2790,6 +2925,7 @@ struct Finalizable
 };
 typedef hx::QuickVec< Finalizable > FinalizableList;
 FILE_SCOPE FinalizableList &sFinalizableList = *new FinalizableList();
+FILE_SCOPE FinalizableList &sOldFinalizableList = *new FinalizableList();
 
 
 static double tFinalizers;
@@ -2800,50 +2936,173 @@ static int localAllocs;
 static int rootObjects;
 static int rootAllocs;
 
-void RunFinalizers()
-{
-   finalizerCount = 0;
+// The first exception a finalizer threw in this collection. The collection
+//  goes on, running the other finalizers, and Collect throws it to its caller
+//  once the other threads are released: thrown straight out of the finalizer,
+//  it left the collector paused and the collection half done (libhxcpp #358)
+std::exception_ptr sFinalizerException;
+// The context of the thread whose collection it was, which alone throws it,
+//  set once the collection is over
+std::atomic<void *> sFinalizerExceptionOwner{ nullptr };
 
-   FinalizerList &list = *sgFinalizers;
-   int idx = 0;
-   while(idx<list.size())
+// Throws what a finalizer threw in this thread's last collection. Collect
+//  calls it when it holds no lock; a collection made for an allocation, under
+//  the state lock, leaves it to the allocator once it has its block
+void ThrowFinalizerException()
+{
+   void *owner = sFinalizerExceptionOwner.load(std::memory_order_acquire);
+   if (!owner || owner!=(void *)hx::tlsStackContext)
+      return;
+   std::exception_ptr thrown = sFinalizerException;
+   sFinalizerException = nullptr;
+   sFinalizerExceptionOwner.store(nullptr, std::memory_order_relaxed);
+   std::rethrow_exception(thrown);
+}
+
+template<typename CALL>
+static void CallFinalizer(CALL inCall)
+{
+   try
    {
-      InternalFinalizer *f = list[idx];
+      inCall();
+   }
+   catch(...)
+   {
+      if (!sFinalizerException)
+         sFinalizerException = std::current_exception();
+   }
+}
+
+// Runs the finalizers in inList whose object died. With inOld, the survivors
+//  move there; without, they stay
+static void RunInternalFinalizers(FinalizerList &inList, FinalizerList *inOld)
+{
+   int idx = 0;
+   while(idx<inList.size())
+   {
+      InternalFinalizer *f = inList[idx];
       if (!f->mValid)
       {
-         list.qerase(idx);
+         inList.qerase(idx);
          delete f;
       }
       else if (((unsigned char *)(f->mObject))[HX_ENDIAN_MARK_ID_BYTE] != gByteMarkID)
       {
          if (f->mFinalizer)
          {
-            f->mFinalizer(f->mObject);
+            CallFinalizer([&]{ f->mFinalizer(f->mObject); });
             finalizerCount++;
          }
-         list.qerase(idx);
+         inList.qerase(idx);
          delete f;
+      }
+      else if (inOld)
+      {
+         inOld->push(f);
+         inList.qerase(idx);
       }
       else
       {
          idx++;
       }
    }
+}
 
-   idx = 0;
-   while(idx<sFinalizableList.size())
+static void RunFinalizables(FinalizableList &inList, FinalizableList *inOld)
+{
+   int idx = 0;
+   while(idx<inList.size())
    {
-      Finalizable &f = sFinalizableList[idx];
+      Finalizable &f = inList[idx];
       unsigned char mark = ((unsigned char *)f.base)[HX_ENDIAN_MARK_ID_BYTE];
       if ( mark!=gByteMarkID )
       {
          finalizerCount++;
-         f.run();
-         sFinalizableList.qerase(idx);
+         // A copy: run may register another, which can move the list
+         Finalizable run = f;
+         inList.qerase(idx);
+         CallFinalizer([&]{ run.run(); });
+      }
+      else if (inOld)
+      {
+         inOld->push(f);
+         inList.qerase(idx);
       }
       else
          idx++;
    }
+}
+
+// Takes the entries of inMap whose object died into outRun. With inOld, the
+//  survivors move there
+template<typename MAP, typename RUN>
+static void TakeDeadFinalizers(MAP &inMap, MAP *inOld, RUN &outRun)
+{
+   for(typename MAP::iterator i=inMap.begin(); i!=inMap.end(); )
+   {
+      hx::Object *obj = i->first;
+      unsigned char mark = ((unsigned char *)obj)[HX_ENDIAN_MARK_ID_BYTE];
+      if ( mark!=gByteMarkID )
+      {
+         finalizerCount++;
+         outRun.push_back( std::make_pair(obj, i->second) );
+         i = inMap.erase(i);
+      }
+      else if (inOld)
+      {
+         (*inOld)[obj] = i->second;
+         i = inMap.erase(i);
+      }
+      else
+         ++i;
+   }
+}
+
+// Clears the references in inList whose target died, and drops those whose
+//  reference died. With inOld, the rest move there
+static void UpdateWeakRefs(WeakRefs &inList, WeakRefs *inOld)
+{
+   for(int i=0;i<inList.size();    )
+   {
+      WeakRef *ref = inList[i];
+      unsigned char mark = ((unsigned char *)ref)[HX_ENDIAN_MARK_ID_BYTE];
+      // Object itself is gone ...
+      if ( mark!=gByteMarkID )
+      {
+         inList.qerase(i);
+         // no i++ ...
+      }
+      else
+      {
+         // what about the reference?
+         if (!IsWeakRefValid(ref->mRef.mPtr))
+         {
+            ref->mRef.mPtr = 0;
+            inList.qerase(i);
+         }
+         else if (inOld)
+         {
+            inOld->push(ref);
+            inList.qerase(i);
+         }
+         else
+            i++;
+      }
+   }
+}
+
+// inMinor: a minor collection, which leaves the old entries alone
+void RunFinalizers(bool inMinor)
+{
+   finalizerCount = 0;
+
+   if (!inMinor)
+      RunInternalFinalizers(*sgOldFinalizers, 0);
+   RunInternalFinalizers(*sgFinalizers, sgOldFinalizers);
+
+   if (!inMinor)
+      RunFinalizables(sOldFinalizableList, 0);
+   RunFinalizables(sFinalizableList, &sOldFinalizableList);
 
    // Unregister dead entries before invoking their callbacks: a finalizer
    // that itself calls val_gc/_hx_set_finalizer(obj,0) (eg, a close()
@@ -2852,41 +3111,21 @@ void RunFinalizers()
    // either invalidates the iterators mid-walk
    static std::vector< std::pair<hx::Object *,hx::finalizer> > sRunNativeFinalizers;
    sRunNativeFinalizers.clear();
-   for(FinalizerMap::iterator i=sFinalizerMap.begin(); i!=sFinalizerMap.end(); )
-   {
-      hx::Object *obj = i->first;
-      unsigned char mark = ((unsigned char *)obj)[HX_ENDIAN_MARK_ID_BYTE];
-      if ( mark!=gByteMarkID )
-      {
-         finalizerCount++;
-         sRunNativeFinalizers.push_back( std::make_pair(obj, i->second) );
-         i = sFinalizerMap.erase(i);
-      }
-      else
-         ++i;
-   }
+   if (!inMinor)
+      TakeDeadFinalizers(sOldFinalizerMap, (FinalizerMap *)0, sRunNativeFinalizers);
+   TakeDeadFinalizers(sFinalizerMap, &sOldFinalizerMap, sRunNativeFinalizers);
    for(size_t run=0; run<sRunNativeFinalizers.size(); run++)
-      (*sRunNativeFinalizers[run].second)(sRunNativeFinalizers[run].first);
+      CallFinalizer([&]{ (*sRunNativeFinalizers[run].second)(sRunNativeFinalizers[run].first); });
    sRunNativeFinalizers.clear();
 
 
    static std::vector< std::pair<hx::Object *,HaxeFinalizer> > sRunHaxeFinalizers;
    sRunHaxeFinalizers.clear();
-   for(HaxeFinalizerMap::iterator i=sHaxeFinalizerMap.begin(); i!=sHaxeFinalizerMap.end(); )
-   {
-      hx::Object *obj = i->first;
-      unsigned char mark = ((unsigned char *)obj)[HX_ENDIAN_MARK_ID_BYTE];
-      if ( mark!=gByteMarkID )
-      {
-         finalizerCount++;
-         sRunHaxeFinalizers.push_back( std::make_pair(obj, i->second) );
-         i = sHaxeFinalizerMap.erase(i);
-      }
-      else
-         ++i;
-   }
+   if (!inMinor)
+      TakeDeadFinalizers(sOldHaxeFinalizerMap, (HaxeFinalizerMap *)0, sRunHaxeFinalizers);
+   TakeDeadFinalizers(sHaxeFinalizerMap, &sOldHaxeFinalizerMap, sRunHaxeFinalizers);
    for(size_t run=0; run<sRunHaxeFinalizers.size(); run++)
-      (*sRunHaxeFinalizers[run].second)(sRunHaxeFinalizers[run].first);
+      CallFinalizer([&]{ (*sRunHaxeFinalizers[run].second)(sRunHaxeFinalizers[run].first); });
    sRunHaxeFinalizers.clear();
 
    MEM_STAMP(hx::tFinalizers);
@@ -2927,28 +3166,9 @@ void RunFinalizers()
 
 
 
-   for(int i=0;i<sWeakRefs.size();    )
-   {
-      WeakRef *ref = sWeakRefs[i];
-      unsigned char mark = ((unsigned char *)ref)[HX_ENDIAN_MARK_ID_BYTE];
-      // Object itself is gone ...
-      if ( mark!=gByteMarkID )
-      {
-         sWeakRefs.qerase(i);
-         // no i++ ...
-      }
-      else
-      {
-         // what about the reference?
-         if (!IsWeakRefValid(ref->mRef.mPtr))
-         {
-            ref->mRef.mPtr = 0;
-            sWeakRefs.qerase(i);
-         }
-         else
-            i++;
-      }
-   }
+   if (!inMinor)
+      UpdateWeakRefs(sOldWeakRefs, 0);
+   UpdateWeakRefs(sWeakRefs, &sOldWeakRefs);
 }
 
 // Callback finalizer on non-abstract type;
@@ -2960,12 +3180,10 @@ void  GCSetFinalizer( hx::Object *obj, hx::finalizer f )
       throw Dynamic(HX_CSTRING("set_finalizer - invalid const object"));
 
    std::lock_guard<hx::FastMutex> lock(*gSpecialObjectLock);
+   // A replacement is new, so the old one goes from either part
+   sOldFinalizerMap.erase(obj);
    if (f==0)
-   {
-      FinalizerMap::iterator i = sFinalizerMap.find(obj);
-      if (i!=sFinalizerMap.end())
-         sFinalizerMap.erase(i);
-   }
+      sFinalizerMap.erase(obj);
    else
       sFinalizerMap[obj] = f;
 }
@@ -2980,12 +3198,10 @@ void  GCSetHaxeFinalizer( hx::Object *obj, HaxeFinalizer f )
       throw Dynamic(HX_CSTRING("set_finalizer - invalid const object"));
 
    std::lock_guard<hx::FastMutex> lock(*gSpecialObjectLock);
+   // A replacement is new, so the old one goes from either part
+   sOldHaxeFinalizerMap.erase(obj);
    if (f==0)
-   {
-      HaxeFinalizerMap::iterator i = sHaxeFinalizerMap.find(obj);
-      if (i!=sHaxeFinalizerMap.end())
-         sHaxeFinalizerMap.erase(i);
-   }
+      sHaxeFinalizerMap.erase(obj);
    else
       sHaxeFinalizerMap[obj] = f;
 }
@@ -3304,6 +3520,10 @@ public:
       mLargeAllocated = 0;
       mLargeMin = (size_t)-1;
       mLargeMax = 0;
+      mLargeOld = 0;
+      mLargeOldMin = (size_t)-1;
+      mLargeOldMax = 0;
+      mLargeOldReleased = false;
       mRecycleSize = 0;
       mLargeAllocSpace = sLargeAllocSpaceFloor;
       mLargeAllocForceRefresh = mLargeAllocSpace;
@@ -3332,6 +3552,8 @@ public:
       // Under the lock, so a collection cannot switch modes between the
       //  check and the push
       ((hx::StackContext *)inAlloc)->mOldReferrers =
+         sGcMode==gcmGenerational ? hx::sGlobalChunks.alloc() : 0;
+      ((hx::StackContext *)inAlloc)->mYoungValues =
          sGcMode==gcmGenerational ? hx::sGlobalChunks.alloc() : 0;
       #endif
       mLocalAllocs.push(inAlloc);
@@ -3401,9 +3623,11 @@ public:
 
       ((unsigned char *)inLarge)[HX_ENDIAN_MARK_ID_BYTE] = 0;
       mLargeListLock.lock();
-      // With no room to recycle it, the sweep frees it instead
+      // With no room to recycle it, the sweep frees it instead, so the next
+      //  sweep must look at the old allocations too
       if (!largeObjectRecycle.hasExtraCapacity(1))
       {
+         mLargeOldReleased = true;
          mLargeListLock.unlock();
          return;
       }
@@ -3417,7 +3641,7 @@ public:
       for(int i=mLargeList.size()-1;i>=0;i--)
          if (mLargeList[i]==blob)
          {
-            mLargeList.qerase(i);
+            eraseLarge(i);
             break;
          }
       largeObjectRecycle.push(blob);
@@ -3543,6 +3767,22 @@ public:
       return result+2;
    }
 
+   // Removes mLargeList[inIdx], keeping the old allocations before the new.
+   //  Under mLargeListLock or in a collection
+   void eraseLarge(int inIdx)
+   {
+      if (inIdx<mLargeOld)
+      {
+         // The last old one fills the gap, and the last new one its place
+         mLargeIndexReady = false;
+         mLargeOld--;
+         mLargeList[inIdx] = mLargeList[mLargeOld];
+         mLargeList.qerase(mLargeOld);
+      }
+      else
+         mLargeList.qerase(inIdx);
+   }
+
    // Under mLargeListLock or in a collection. Callers can release more
    // managed memory than they reported, which must not wrap the count
    void takeLargeAllocated(size_t inBytes)
@@ -3576,9 +3816,13 @@ public:
             CollectFromThisThread(false,false);
          }
 
-         int rounded = (inDelta +3) & ~3;
-   
-         growLargeAllocSpace((size_t)rounded<<1);
+         // In size_t, which holds any positive int rounded up: in int, a delta
+         //  near the top of its range overflowed to an allowance near the size_t
+         //  maximum, which the halving at each collection took far too long to
+         //  undo. Twice that is clamped for a 32-bit size_t.
+         size_t rounded = ((size_t)inDelta + 3) & ~(size_t)3;
+         const size_t maxSpace = std::numeric_limits<size_t>::max()/2;
+         growLargeAllocSpace(rounded > maxSpace ? maxSpace : rounded<<1);
       }
 
       #ifndef HXCPP_SINGLE_THREADED_APP
@@ -3946,20 +4190,28 @@ public:
       #endif
        // FinalizerList will get visited...
 
-       hx::FinalizerMap::iterator i = hx::sFinalizerMap.find(inFrom);
-       if (i!=hx::sFinalizerMap.end())
+       hx::FinalizerMap *finalizerMaps[] = { &hx::sFinalizerMap, &hx::sOldFinalizerMap };
+       for(hx::FinalizerMap *map : finalizerMaps)
        {
-          hx::finalizer f = i->second;
-          hx::sFinalizerMap.erase(i);
-          hx::sFinalizerMap[inTo] = f;
+          hx::FinalizerMap::iterator i = map->find(inFrom);
+          if (i!=map->end())
+          {
+             hx::finalizer f = i->second;
+             map->erase(i);
+             (*map)[inTo] = f;
+          }
        }
 
-       hx::HaxeFinalizerMap::iterator h = hx::sHaxeFinalizerMap.find(inFrom);
-       if (h!=hx::sHaxeFinalizerMap.end())
+       hx::HaxeFinalizerMap *haxeMaps[] = { &hx::sHaxeFinalizerMap, &hx::sOldHaxeFinalizerMap };
+       for(hx::HaxeFinalizerMap *map : haxeMaps)
        {
-          hx::HaxeFinalizer f = h->second;
-          hx::sHaxeFinalizerMap.erase(h);
-          hx::sHaxeFinalizerMap[inTo] = f;
+          hx::HaxeFinalizerMap::iterator h = map->find(inFrom);
+          if (h!=map->end())
+          {
+             hx::HaxeFinalizer f = h->second;
+             map->erase(h);
+             (*map)[inTo] = f;
+          }
        }
 
        hx::MakeZombieSet::iterator mz = hx::sMakeZombieSet.find(inFrom);
@@ -4428,18 +4680,24 @@ public:
          }
       }
 
-      if (hx::sgFinalizers)
-         for(int i=0;i<hx::sgFinalizers->size();i++)
-            (*hx::sgFinalizers)[i]->Visit(inCtx);
+      hx::FinalizerList *finalizerLists[] = { hx::sgFinalizers, hx::sgOldFinalizers };
+      for(hx::FinalizerList *list : finalizerLists)
+         if (list)
+            for(int i=0;i<list->size();i++)
+               (*list)[i]->Visit(inCtx);
 
-      for(int i=0;i<hx::sFinalizableList.size();i++)
-         inCtx->visitAlloc( &hx::sFinalizableList[i].base );
+      hx::FinalizableList *finalizables[] = { &hx::sFinalizableList, &hx::sOldFinalizableList };
+      for(hx::FinalizableList *list : finalizables)
+         for(int i=0;i<list->size();i++)
+            inCtx->visitAlloc( &(*list)[i].base );
 
       for(int i=0;i<hx::sZombieList.size();i++)
          inCtx->visitObject( &hx::sZombieList[i] );
 
-      for(int i=0;i<hx::sWeakRefs.size(); i++)
-         inCtx->visitObject( (hx::Object **) &hx::sWeakRefs[i] );
+      hx::WeakRefs *weakRefs[] = { &hx::sWeakRefs, &hx::sOldWeakRefs };
+      for(hx::WeakRefs *list : weakRefs)
+         for(int i=0;i<list->size(); i++)
+            inCtx->visitObject( (hx::Object **) &(*list)[i] );
 
       for(int i=0;i<hx::sWeakHashList.size();i++)
          inCtx->visitObject( (hx::Object **) &hx::sWeakHashList[i] );
@@ -4795,8 +5053,10 @@ public:
    double tMarked;
    void MarkAll(bool inGenerational)
    {
-      mLargeIndexReady = false;
+      // The old allocations' index stays: only a change to them drops it
       mLargeLookups = 0;
+      mYoungLargeIndexReady = false;
+      mYoungLargeLookups = 0;
 
       if (!inGenerational)
       {
@@ -4839,13 +5099,15 @@ public:
       }
 
       #ifdef HXCPP_GC_MOVING
-      for(int i=0;i<hx::sFinalizableList.size();i++)
-      {
-         hx::Finalizable &f = hx::sFinalizableList[i];
-         uintptr_t base = reinterpret_cast<uintptr_t>(f.base);
-         if (f.pin && GetMemType(base)==memBlock)
-            (*gBlockInfo)[reinterpret_cast<BlockData*>(base & IMMIX_BLOCK_BASE_MASK)->mId]->pin();
-      }
+      hx::FinalizableList *finalizables[] = { &hx::sFinalizableList, &hx::sOldFinalizableList };
+      for(hx::FinalizableList *list : finalizables)
+         for(int i=0;i<list->size();i++)
+         {
+            hx::Finalizable &f = (*list)[i];
+            uintptr_t base = reinterpret_cast<uintptr_t>(f.base);
+            if (f.pin && GetMemType(base)==memBlock)
+               (*gBlockInfo)[reinterpret_cast<BlockData*>(base & IMMIX_BLOCK_BASE_MASK)->mId]->pin();
+         }
       #endif
 
       MEM_STAMP(tMarkInit);
@@ -4898,6 +5160,15 @@ public:
       #endif
 
 
+      #ifdef HXCPP_GC_GENERATIONAL
+      {
+      hx::AutoMarkPush info(&mMarker,"Young array values","young");
+      // The first mark of a collection takes the log: a full one has no use
+      //  for it, and one that follows a minor mark has marked these already
+      hx::MarkYoungValues(inGenerational, &mMarker);
+      }
+      #endif
+
       {
       hx::AutoMarkPush info(&mMarker,"Zombies","zombie");
       // Mark zombies too....
@@ -4946,7 +5217,7 @@ public:
       hx::FindZombies(mMarker);
       MarkWeakHashValues();
 
-      hx::RunFinalizers();
+      hx::RunFinalizers(inGenerational);
 
       // Finalizers and weak reference checks may still look at dead script objects
       #ifdef HXCPP_SCRIPTABLE
@@ -4992,32 +5263,34 @@ public:
 
    // Weak-key hashes are ephemerons: a value is reachable only while the hash and its
    // key are. A value can make keys in other weak hashes reachable, so this repeats
-   // until nothing more is marked.
+   // until nothing more is marked. What a hash's values reach is marked before the
+   // next hash is looked at, so a chain of weak maps whose keys lead from one to the
+   // next resolves in one pass when the scan goes along it, and the scan alternates
+   // direction, so one registered the other way resolves in the next (libhxcpp #203).
+   // Before, what a pass found was marked only at the end of the pass, by restarting
+   // the marking threads, so such a chain gave up one link per pass.
    void MarkWeakHashValues()
    {
       bool marked;
+      bool forward = true;
       do
       {
          marked = false;
-         mMarker.init();
-         for(int i=0;i<hx::sWeakHashList.size();i++)
+         int count = hx::sWeakHashList.size();
+         for(int i=0;i<count;i++)
          {
-            hx::HashRoot *hash = hx::sWeakHashList[i];
+            hx::HashRoot *hash = hx::sWeakHashList[forward ? i : count-1-i];
             if (hx::IsWeakRefValid(hash))
-               marked = hash->markWeakValues(&mMarker) || marked;
-         }
-         if (marked)
-         {
-            #ifdef HX_MULTI_THREAD_MARKING
-            if (!sgCensus)
             {
-               mMarker.releaseJobs();
-               StartThreadJobs(tpjMark, MAX_GC_THREADS, true);
+               mMarker.init();
+               if (hash->markWeakValues(&mMarker))
+               {
+                  marked = true;
+                  mMarker.processMarkStack();
+               }
             }
-            else
-            #endif
-               mMarker.processMarkStack();
          }
+         forward = !forward;
       }
       while(marked);
    }
@@ -5143,8 +5416,10 @@ public:
             else
                 hx::sGlobalChunks.free( ctx->mOldReferrers );
             ctx->mOldReferrers = 0;
+            hx::TakeYoungValues( ctx->mYoungValues );
          }
       }
+      hx::sCollectCycle++;
 
       generational = !inMajor && !inForceCompact && sGcMode == gcmGenerational;
       if (sGcMode==gcmGenerational)
@@ -5313,11 +5588,23 @@ public:
          recycleRemaining = mLargeAllocForceRefresh;
       #endif
 
-      int idx = 0;
+      // The allocations that survived a collection come first in the list. A
+      // minor collection cannot free one, so it sweeps only those made since,
+      // unless an old one was released for the sweep to free. It used to
+      // sweep them all, touching every long-lived buffer (libhxcpp #318).
+      bool sweepOld = !generational || mLargeOldReleased;
+      mLargeOldReleased = false;
+      int firstNew = mLargeOld;
+      int idx = sweepOld ? 0 : mLargeOld;
+      if (sweepOld)
+      {
+         mLargeOld = 0;
+         mLargeIndexReady = false;
+      }
       int l0 = mLargeList.size();
       // Bounds of the survivors, so a past burst does not keep them wide
-      size_t largeMin = (size_t)-1;
-      size_t largeMax = 0;
+      size_t largeMin = sweepOld ? (size_t)-1 : mLargeOldMin;
+      size_t largeMax = sweepOld ? 0 : mLargeOldMax;
       while(idx<mLargeList.size())
       {
          unsigned int *blob = mLargeList[idx];
@@ -5347,8 +5634,18 @@ public:
             idx++;
          }
       }
-      mLargeMin = largeMin;
-      mLargeMax = largeMax;
+      // Every survivor is old now. A kept index takes the new survivors' bases
+      if (mLargeIndexReady && mLargeList.size()>firstNew)
+      {
+         size_t had = mLargeIndex.size();
+         for(int i=firstNew;i<mLargeList.size();i++)
+            mLargeIndex.push_back( reinterpret_cast<uintptr_t>(mLargeList[i] + 2) );
+         std::sort(mLargeIndex.begin()+had, mLargeIndex.end());
+         std::inplace_merge(mLargeIndex.begin(), mLargeIndex.begin()+had, mLargeIndex.end());
+      }
+      mLargeOld = mLargeList.size();
+      mLargeOldMin = mLargeMin = largeMin;
+      mLargeOldMax = mLargeMax = largeMax;
       mRecycleSize.store((int)largeObjectRecycle.size(), std::memory_order_relaxed);
 
       int l1 = mLargeList.size();
@@ -5616,6 +5913,7 @@ public:
          {
             hx::StackContext *ctx = (hx::StackContext *)mLocalAllocs[i];
             ctx->mOldReferrers = hx::sGlobalChunks.alloc();
+            ctx->mYoungValues = hx::sGlobalChunks.alloc();
          }
       #endif
 
@@ -5637,6 +5935,8 @@ public:
 
       sgIsCollecting = false;
 
+      if (hx::sFinalizerException)
+         hx::sFinalizerExceptionOwner.store((void *)hx::tlsStackContext, std::memory_order_release);
 
       hx::gPauseForCollect = 0x00000000;
       #ifndef HXCPP_SINGLE_THREADED_APP
@@ -5659,6 +5959,9 @@ public:
 
 
       PROFILE_COLLECT_SUMMARY_END;
+
+      if (!inLocked)
+         hx::ThrowFinalizerException();
    }
 
    void reclaimBlocks(bool full, BlockDataStats &outStats)
@@ -5688,7 +5991,21 @@ public:
 
    void countRows(BlockDataStats &outStats)
    {
-      if (MAX_GC_THREADS>1)
+      // A block a minor collection marked nothing new in needs no recount, so
+      // with few that do the work is less than waking the marking threads for
+      // it: that took most of an otherwise idle minor collection (#329)
+      bool threaded = MAX_GC_THREADS>1;
+      #ifdef HXCPP_GC_GENERATIONAL
+      if (threaded)
+      {
+         int changed = 0;
+         for(int i=0;i<mAllBlocks.size() && changed<=256;i++)
+            if (mAllBlocks[i]->mHasSurvivor)
+               changed++;
+         threaded = changed>256;
+      }
+      #endif
+      if (threaded)
       {
          for(int i=0;i<MAX_GC_THREADS;i++)
             sThreadBlockDataStats[i].clear();
@@ -5838,19 +6155,42 @@ public:
 
       // Only the collector looks up while marking, with the list fixed, so once
       // a collection has seen several candidates in range it sorts the bases
-      // and searches them instead of scanning the list for each
-      if (!mLargeIndexReady && mLargeList.size()>64 && ++mLargeLookups>8)
+      // and searches them instead of scanning the list for each. The old
+      // allocations' sorted bases are kept while they do not change, which a
+      // minor collection cannot do: sorting them again in each collection
+      // took longer than sweeping them did (libhxcpp #318).
+      if (!mLargeIndexReady && mLargeOld>64 && ++mLargeLookups>8)
       {
-         uintptr_t *index = mLargeIndex.setSize(mLargeList.size());
-         for(int i=0;i<mLargeList.size();i++)
-            index[i] = reinterpret_cast<uintptr_t>(mLargeList[i] + 2);
-         std::sort(index, index + mLargeList.size());
+         mLargeIndex.resize(mLargeOld);
+         for(int i=0;i<mLargeOld;i++)
+            mLargeIndex[i] = reinterpret_cast<uintptr_t>(mLargeList[i] + 2);
+         std::sort(mLargeIndex.begin(), mLargeIndex.end());
          mLargeIndexReady = true;
       }
       if (mLargeIndexReady)
-         return std::binary_search(&mLargeIndex[0], &mLargeIndex[0] + mLargeIndex.size(), inPtr) ? memLarge : memUnmanaged;
+      {
+         if (std::binary_search(mLargeIndex.begin(), mLargeIndex.end(), inPtr))
+            return memLarge;
+      }
+      else
+         for(int i=0;i<mLargeOld;i++)
+            if (reinterpret_cast<uintptr_t>(mLargeList[i] + 2)==inPtr)
+               return memLarge;
 
-      for(int i=0;i<mLargeList.size();i++)
+      // Those made since the last collection, which change in each
+      int young = mLargeList.size() - mLargeOld;
+      if (!mYoungLargeIndexReady && young>64 && ++mYoungLargeLookups>8)
+      {
+         mYoungLargeIndex.resize(young);
+         for(int i=0;i<young;i++)
+            mYoungLargeIndex[i] = reinterpret_cast<uintptr_t>(mLargeList[mLargeOld+i] + 2);
+         std::sort(mYoungLargeIndex.begin(), mYoungLargeIndex.end());
+         mYoungLargeIndexReady = true;
+      }
+      if (mYoungLargeIndexReady)
+         return std::binary_search(mYoungLargeIndex.begin(), mYoungLargeIndex.end(), inPtr) ? memLarge : memUnmanaged;
+
+      for(int i=mLargeOld;i<mLargeList.size();i++)
       {
          uintptr_t blob{ reinterpret_cast<uintptr_t>(mLargeList[i] + 2) };
          if (blob==inPtr)
@@ -5869,9 +6209,20 @@ public:
    std::atomic_size_t mLargeAllocated;
    size_t mLargeMin;
    size_t mLargeMax;
-   hx::QuickVec<uintptr_t> mLargeIndex;
+   // mLargeList[0..mLargeOld) survived a collection, and the rest are newer.
+   //  The bounds are of the old ones, at the last sweep
+   int mLargeOld;
+   size_t mLargeOldMin;
+   size_t mLargeOldMax;
+   // An old allocation was released for the sweep to free
+   bool mLargeOldReleased;
+   // The sorted bases of mLargeList[0..mLargeOld), and of the rest
+   std::vector<uintptr_t> mLargeIndex;
    bool mLargeIndexReady = false;
    int mLargeLookups = 0;
+   std::vector<uintptr_t> mYoungLargeIndex;
+   bool mYoungLargeIndexReady = false;
+   int mYoungLargeLookups = 0;
    size_t mTotalAfterLastCollect;
    size_t mAllBlocksCount;
    size_t mLiveBytes;
@@ -5990,7 +6341,11 @@ void MarkConservative(int *inBottom, int *inTop,hx::MarkContext *__inCtx)
             if (mem==memLarge)
             {
                unsigned char& mark{ reinterpret_cast<unsigned char*>(potentialObject)[HX_ENDIAN_MARK_ID_BYTE] };
-               if (mark != gByteMarkID)
+               // A large object's members are marked as from any other root:
+               //  setting its mark kept the object but none of what it held
+               if (reinterpret_cast<unsigned int*>(potentialObject)[-1] & IMMIX_ALLOC_IS_CONTAINER)
+                  hx::MarkObjectAlloc(reinterpret_cast<hx::Object*>(potentialObject), __inCtx);
+               else if (mark != gByteMarkID)
                {
                   if (sgCensus)
                      sgCensusDeferred->push_back(std::make_pair(reinterpret_cast<void*>(potentialObject), true));
@@ -6145,6 +6500,7 @@ public:
 
       #ifdef HXCPP_GC_GENERATIONAL
       mOldReferrers = 0;
+      mYoungValues = 0;
       #endif
 
       AttachThread(inTopOfStack);
@@ -6208,6 +6564,10 @@ public:
          else
             hx::sGlobalChunks.free( mOldReferrers );
          mOldReferrers = 0;
+      }
+      {
+         std::lock_guard<hx::FastMutex> lock(hx::sYoungValueLock);
+         hx::TakeYoungValues( mYoungValues );
       }
       #endif
 
@@ -6730,6 +7090,9 @@ public:
             #endif
             mCurrentHole = 1;
             mMoreHoles = mCurrentHole<mCurrentHoles;
+
+            // From a collection GetFreeBlock made: the block is ours now
+            hx::ThrowFinalizerException();
          }
 
          // Other thread may have started collect, in which case we may just
@@ -6967,6 +7330,7 @@ void InitAlloc()
    sgAllocInit = true;
    sGlobalAlloc = new GlobalAllocator();
    sgFinalizers = new FinalizerList();
+   sgOldFinalizers = new FinalizerList();
    sFinalizerLock = new std::mutex();
    sGCRootLock = new std::mutex();
    sgRootSet = new RootSet();
@@ -7375,7 +7739,9 @@ int __hxcpp_gc_trace(hx::Class inClass,bool inPrint)
        gCollectTrace = inClass.GetPtr();
        gCollectTraceCount = 0;
        gCollectTraceDoPrint = inPrint;
-       hx::InternalCollect(false,false);
+       // Major, so that every live instance is marked and counted: a minor
+       //  collection skips the old ones, which are marked already
+       hx::InternalCollect(true,false);
        gCollectTrace = 0;
        return gCollectTraceCount;
     #endif
